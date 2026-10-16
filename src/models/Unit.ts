@@ -38,8 +38,10 @@ export interface IUnit extends Document {
   institution: mongoose.Types.ObjectId;
   code: string;
   name: string;
-  schoolCode: string;        // NEW
-  departmentCode: string;    // NEW
+  schoolCode: string;        
+  departmentCode: string;
+  /** Optional default CA/exam split for this unit (ca + exam = 100). Absent = 30/70 (workshops 40/60). */
+  markDistribution?: { ca: number; exam: number };    
 }
 
 const schema = new Schema<IUnit>(
@@ -53,6 +55,7 @@ const schema = new Schema<IUnit>(
     name: { type: String, required: true, trim: true },
     schoolCode:     { type: String, required: true, uppercase: true, trim: true },
     departmentCode: { type: String, required: true, uppercase: true, trim: true },
+    markDistribution: { type: new Schema({ ca: { type: Number, min: 0, max: 99 }, exam: { type: Number, min: 1, max: 100 } }, { _id: false }), required: false },
   },
   { timestamps: true }
 );

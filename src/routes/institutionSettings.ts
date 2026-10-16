@@ -1,6 +1,11 @@
 // serverside/src/routes/institutionSettings.ts — COMPLETE, FINAL VERSION
 import express, { Response } from "express";
 import InstitutionSettings   from "../models/InstitutionSettings";
+import Program from "../models/Program";
+import Student from "../models/Student";
+import AcademicYear from "../models/AcademicYear";
+import { getIntakeDefinitions } from "../utils/intakeDefinitions";
+import { validateIntakeDefinitions, LEGACY_INTAKE_DEFINITIONS } from "../utils/semesterLabels";
 import { AuthenticatedRequest, requireAuth, requireRole } from "../middleware/auth";
 import { asyncHandler }         from "../middleware/asyncHandler";
 import { logAudit }             from "../lib/auditLogger";
@@ -62,7 +67,18 @@ router.get(
       details: { institutionId },
     });
 
-    res.json(settings ?? null);
+    // Always hand clients a usable intake list (legacy SEPT/JAN/MAY until configured)
+    res.json(
+      settings
+        ? {
+            ...settings,
+            intakeDefinitions:
+              (settings as { intakeDefinitions?: unknown[] }).intakeDefinitions?.length
+                ? (settings as { intakeDefinitions?: unknown[] }).intakeDefinitions
+                : LEGACY_INTAKE_DEFINITIONS,
+          }
+        : null,
+    );
   }),
 );
 
@@ -99,6 +115,7 @@ router.post(
       "semesterWeights",
       "enforceRegNoPattern",
       "supportedIntakes",
+      "intakeDefinitions",
     ]);
 
     const ADMIN_FIELDS = new Set([
@@ -138,6 +155,35 @@ router.post(
           return;
         }
       }
+    }
+
+    // Intake definitions: validate, and don't allow removing one that is still in use
+    if (filteredData.intakeDefinitions !== undefined) {
+      const checked = validateIntakeDefinitions(filteredData.intakeDefinitions);
+      if ("error" in checked) {
+        res.status(422).json({ message: checked.error });
+        return;
+      }
+      const oldDefs = await getIntakeDefinitions(institutionId);
+      const newCodes = new Set(checked.definitions.map((d) => d.code));
+      for (const old of oldDefs) {
+        if (newCodes.has(old.code)) continue;
+        const [programs, students, years] = await Promise.all([
+          Program.countDocuments({ institution: institutionId, intakes: old.code }),
+          Student.countDocuments({ institution: institutionId, intake: old.code }),
+          AcademicYear.countDocuments({ institution: institutionId, intakes: old.code }),
+        ]);
+        if (programs + students + years > 0) {
+          res.status(422).json({
+            message:
+              `Cannot remove the ${old.code} intake: it is used by ${programs} program(s), ` +
+              `${students} student(s) and ${years} academic year(s). Move them to another intake first.`,
+          });
+          return;
+        }
+      }
+      filteredData.intakeDefinitions = checked.definitions;
+      filteredData.supportedIntakes  = checked.definitions.map((d) => d.code); // keep legacy field in sync
     }
 
     const previous = await InstitutionSettings.findOne({ institution: institutionId }).lean();

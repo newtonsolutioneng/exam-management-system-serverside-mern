@@ -1,6 +1,7 @@
 // serverside/src/routes/studentSearch.ts
 
 import express, { Response } from "express";
+import { splitRegNo, regNoAnyQualifierRegex } from "../utils/regNoQualifier";
 import Student from "../models/Student";
 import FinalGrade from "../models/FinalGrade";
 import MarkDirect from "../models/MarkDirect";
@@ -77,7 +78,7 @@ router.get("/record", requireAuth, asyncHandler(async (req: AuthenticatedRequest
   regNo = decodeURIComponent(regNo);
 
   const [student, settings] = await Promise.all([
-    Student.findOne({ regNo: { $regex: `^${regNo}$`, $options: "i" } }).populate("program"),
+    Student.findOne({ regNo: { $regex: regNoAnyQualifierRegex(splitRegNo(regNo).base) } }).populate("program"),
     InstitutionSettings.findOne().lean(),
   ]);
   if (!student) return res.status(404).json({ error: "Student not found" });
@@ -151,7 +152,7 @@ const formatChallenges = (analysis: any) => ({
 //     if (!regNo) return res.status(400).json({ error: "regNo is required" });
 
 //     const student = (await Student.findOne(
-//       scopeQuery(req, { regNo: regNo as string }),
+//       scopeQuery(req, { regNo: { $regex: regNoAnyQualifierRegex(splitRegNo(regNo).base) } }),
 //     )
 //       .populate("admissionAcademicYear", "year")
 //       .populate("program")
@@ -1024,7 +1025,7 @@ router.post("/readmit", requireAuth, requireRole("coordinator"), asyncHandler(as
 router.get("/raw-marks", requireAuth, requireRole("coordinator"), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const { regNo, yearOfStudy } = req.query;
   if (!regNo) return res.status(400).json({ error: "regNo required" });
-  const student = await Student.findOne({ regNo: { $regex: `^${regNo}$`, $options: "i" } });
+  const student = await Student.findOne({ regNo: { $regex: regNoAnyQualifierRegex(splitRegNo(regNo).base) } });
   if (!student) return res.status(404).json({ error: "Student not found" });
   const [dm, dmt] = await Promise.all([
     Mark.find({ student: student._id }).populate({ path: "programUnit", match: yearOfStudy ? { requiredYear: parseInt(yearOfStudy as string) } : {}, populate: { path: "unit", select: "code name" } }).populate("academicYear", "year").lean(),
@@ -1036,7 +1037,7 @@ router.get("/raw-marks", requireAuth, requireRole("coordinator"), asyncHandler(a
 router.post("/raw-marks", requireAuth, requireRole("coordinator"), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
   const { regNo, unitCode, academicYear, semester, cat1, cat2, cat3, assignment1, practicalRaw, examQ1, examQ2, examQ3, examQ4, examQ5, examMode, caDirect, examDirect, agreedMark, isSpecial, attempt } = req.body;
   if (!regNo || !unitCode || !academicYear) return res.status(400).json({ error: "regNo, unitCode, and academicYear are required" });
-  const [student, unitDoc, yearDoc] = await Promise.all([Student.findOne({ regNo: { $regex: `^${regNo}$`, $options: "i" } }), Unit.findOne({ code: unitCode.toUpperCase().trim() }), AcademicYear.findOne({ year: academicYear })]);
+  const [student, unitDoc, yearDoc] = await Promise.all([Student.findOne({ regNo: { $regex: regNoAnyQualifierRegex(splitRegNo(regNo).base) } }), Unit.findOne({ code: unitCode.toUpperCase().trim() }), AcademicYear.findOne({ year: academicYear })]);
   if (!student || !unitDoc || !yearDoc) return res.status(404).json({ error: "Required metadata not found" });
   const programUnit = await ProgramUnit.findOne({ program: student.program, unit: unitDoc._id });
   if (!programUnit) return res.status(400).json({ error: `Unit ${unitCode} not linked to student's program.` });

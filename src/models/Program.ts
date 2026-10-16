@@ -186,6 +186,7 @@
 
 // serverside/src/models/Program.ts — COMPLETE, FINAL
 
+import { INTAKE_CODE_REGEX } from "../utils/semesterLabels";
 import mongoose, { Schema, Document } from "mongoose";
 import { normalizeProgramName } from "../services/programNormalizer";
 
@@ -209,7 +210,7 @@ export interface IProgram extends Document {
   description?:        string;
   durationYears:       number;
   degreeType:          string;
-  intakes:             ("JAN" | "MAY" | "SEPT")[];
+  intakes:             string[];
   supportedEntryTypes: ("Direct" | "Mid-Entry-Y2" | "Mid-Entry-Y3" | "Mid-Entry-Y4")[];
   ruleOverrides:       IProgramRuleOverrides;
   isActive:            boolean;
@@ -253,7 +254,7 @@ const ProgramSchema = new Schema<IProgram>(
 
     durationYears: { type: Number, required: true, min: 1, max: 10, default:  5 },
     degreeType: { type: String, required: true, enum: ["BSc","BEd","BTech","BEng","BArch","MBBS","LLB","BPharm","Other"], default:  "BSc" },
-    intakes: { type: [String], enum: ["JAN","MAY","SEPT"], default: ["SEPT"]},
+    intakes: { type: [{ type: String, match: INTAKE_CODE_REGEX }], default: ["SEPT"]},
     supportedEntryTypes: { type: [String], enum: ["Direct","Mid-Entry-Y2","Mid-Entry-Y3","Mid-Entry-Y4"], default: ["Direct"]},
     ruleOverrides: { type: ProgramRuleOverridesSchema, default: () => ({}) },
     isActive:      { type: Boolean, default: true },

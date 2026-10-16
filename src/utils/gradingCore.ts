@@ -1,5 +1,7 @@
 // serverside/src/utils/gradingCore.ts
 
+import { unitWeights, defaultDistributionFor } from "./markDistribution";
+
 export interface GradingInput {
   cat1: number; cat2: number; cat3?: number;
   ass1: number; ass2?: number; ass3?: number;
@@ -8,6 +10,9 @@ export interface GradingInput {
   unitType: "theory" | "lab" | "workshop";
   examMode: "standard" | "mandatory_q1";
   attempt: string; // "1st", "supplementary", "special", "re-take"
+  /** Unit mark distribution (ca + exam = 100). Omit for legacy behaviour (30/70, workshop 40/60). */
+  caMax?: number;
+  examMax?: number;
   settings: {
     catMax: number; assMax: number; practicalMax: number; passMark: number;
   };
@@ -17,12 +22,12 @@ export const calculateFinalResult = (input: GradingInput) => {
   const { cat1, cat2, cat3, ass1, ass2, ass3, practical, examQ1, examQ2, examQ3, examQ4, examQ5, unitType, examMode, attempt, settings } = input;
 
   // 1. Determine Weights (Mirroring Excel generateFullScoresheetTemplate)
-  const weights = {
-    practical: unitType === "lab" ? 15 : unitType === "workshop" ? 40 : 0,
-    assignment: unitType === "lab" ? 5 : unitType === "theory" ? 10 : 0,
-    tests: unitType === "lab" ? 10 : unitType === "theory" ? 20 : 0,
-    exam: unitType === "workshop" ? 60 : 70,
-  };
+  const weights = unitWeights(
+        unitType,
+        input.caMax !== undefined && input.examMax !== undefined
+          ? { ca: input.caMax, exam: input.examMax }
+          : defaultDistributionFor(unitType),
+      );
 
   // 2. CA Calculation
   let caTotal = 0;

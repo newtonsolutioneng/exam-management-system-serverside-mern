@@ -14,6 +14,10 @@ export interface IMarkDirect extends Document {
   externalTotal100?: number;  // Calculated: (examTotal70 / 70) * 100
   agreedMark: number;   // Calculated: CA + Exam
   attempt: string;
+  caMax?: number;       // distribution this sheet was captured under (absent = 30/70)
+  examMax?: number;
+  unitType?: "theory" | "lab" | "workshop";
+  examMode?: "standard" | "mandatory_q1";
 
   isSupplementary: boolean; // Derived from attempt field
   isRetake: boolean; // Derived from attempt field
@@ -34,8 +38,13 @@ const schema = new Schema<IMarkDirect>({
   semester: { type: String, enum: ["SEMESTER 1", "SEMESTER 2", "SEMESTER 3"], required: true, default: "SEMESTER 1" },
   batchId: { type: String, required: true, index: true },
 
-  caTotal30: { type: Number, min: 0, max: 30, required: true },
-  examTotal70: { type: Number, min: 0, max: 70, required: true },
+  // Historical names — CA / exam parts under the unit's distribution (30/70 by default); bounds enforced by importers.
+  caTotal30: { type: Number, min: 0, max: 100, required: true },
+  examTotal70: { type: Number, min: 0, max: 100, required: true },
+  caMax: { type: Number, min: 0, max: 99 },
+  examMax: { type: Number, min: 1, max: 100 },
+  unitType: { type: String, enum: ["theory", "lab", "workshop"] },
+  examMode: { type: String, enum: ["standard", "mandatory_q1"], default: "standard" },
   externalTotal100: { type: Number, min: 0, max: 100, default: null },
   agreedMark: { type: Number, min: 0, max: 100, required: true },
   attempt: { type: String, enum: ["1st", "re-take", "supplementary", "special"], default: "1st" },

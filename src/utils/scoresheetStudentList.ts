@@ -10,8 +10,8 @@ import FinalGrade from "../models/FinalGrade";
 import ProgramUnit from "../models/ProgramUnit";
 import AcademicYear from "../models/AcademicYear";
 import { buildDisplayRegNo } from "./academicRules";
+import { splitRegNo, regNoAnyQualifierRegex } from "./regNoQualifier";
 import { getCarryForwardStudentsForUnit, getDeferredSuppStudentsForUnit, getStayoutStudentsForUnit } from "../services/carryForwardService";
-
 
 export interface ScoresheetStudent {
   regNo:            string;
@@ -26,7 +26,8 @@ export interface ScoresheetStudent {
   isStayout:        boolean;
   isRepeatYear:     boolean;
   isDeferredSupp:   boolean;   // NEW: student from higher year, sitting deferred unit
-  prevMark?:        any;
+  isExtra:          boolean;   // added by the coordinator: not part of the main class
+   prevMark?:        any;
   qualifierSuffix?: string;
 }
  
@@ -128,6 +129,9 @@ export const buildScoresheetStudentList = async (params: {
   academicYearId: mongoose.Types.ObjectId;
   session:        "ORDINARY" | "SUPPLEMENTARY" | "CLOSED";
   passMark:       number;
+  /** Reg nos of students outside the main class (other cohorts, late registrations …) to add to the sheet. */
+    extraRegNos?:   string[];
+    institutionId?: unknown;
 }): Promise<ScoresheetStudent[]> => {
   const { programId, programUnitId, yearOfStudy, academicYearId, session, passMark } = params;
  
@@ -159,6 +163,7 @@ export const buildScoresheetStudentList = async (params: {
       isStayout:        false,
       isRepeatYear:     false,
       isDeferredSupp:   false,
+      isExtra:          false,
       qualifierSuffix:  student.qualifierSuffix || "",
       prevMark,
       ...flags,
@@ -194,8 +199,10 @@ export const buildScoresheetStudentList = async (params: {
       }
     }
  
-    // Current-year fallback: students in this year with no mark for this unit yet
-    if (academicYear.isCurrent) {
+    // Current-year fallback: students in this year with no mark for this unit yet.
+    // Also used when nothing has been uploaded for this unit/year yet — otherwise a sheet for a
+    // year that is not flagged "current" came out completely blank.
+    if (academicYear.isCurrent || allMarkedIds.length === 0) {
       const currentStudents = await Student.find({
         program:            programId,
         currentYearOfStudy: yearOfStudy,
@@ -349,9 +356,24 @@ export const buildScoresheetStudentList = async (params: {
   }
  
   // Sort: primary (1), CF (2), stayout/deferred (3)
+  // ── Students outside the main class (coordinator-supplied reg nos) ─────────
+  for (const raw of params.extraRegNos ?? []) {
+    const { base } = splitRegNo(raw);
+    if (!base) continue;
+    const student = await Student.findOne({
+      regNo: { $regex: regNoAnyQualifierRegex(base) },
+      ...(params.institutionId ? { institution: params.institutionId } : {}),
+    }).lean() as any;
+    if (!student || EXCLUDED.includes(student.status)) continue;
+    const { status: priorStatus } = await _resolveUnitStatus(student._id.toString(), programUnitId.toString(), passMark);
+    const retake = priorStatus === "SUPPLEMENTARY";
+    add(student, retake ? ATTEMPT.RETAKE : ATTEMPT.FIRST, { isStayout: retake, isExtra: true });
+  }
+
+  // Sort: primary (1), CF (2), stayout/deferred (3), extras last (4)
   return result.sort((a, b) => {
     const rank = (s: ScoresheetStudent) =>
-      s.isCarryForward || s.isDeferredSupp || s.isStayout ? 2 : 1;
+      s.isExtra ? 4 : s.isCarryForward || s.isDeferredSupp || s.isStayout ? 2 : 1;
     if (rank(a) !== rank(b)) return rank(a) - rank(b);
     return a.regNo.localeCompare(b.regNo);
   });

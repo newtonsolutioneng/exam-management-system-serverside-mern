@@ -3,12 +3,14 @@ import * as ExcelJS from "exceljs";
 import Program from "../models/Program";
 import Unit from "../models/Unit";
 import AcademicYear from "../models/AcademicYear";
+import { semesterWord } from "./semesterLabels";
 import ProgramUnit from "../models/ProgramUnit";
 import InstitutionSettings from "../models/InstitutionSettings";
 import config from "../config/config";
 import mongoose from "mongoose";
-import { buildRichRegNo, buildScoresheetStudentList, getExistingMarksForStudents, ScoresheetStudent } from "./scoresheetStudentList";
-import { loadInstitutionSettings } from "./loadInstitutionSettings";
+import { MarkDistribution, resolveDistribution, encodeSheetMeta, META_CELL } from "./markDistribution";
+ import { buildRichRegNo, buildScoresheetStudentList, getExistingMarksForStudents, ScoresheetStudent } from "./scoresheetStudentList";
+ import { loadInstitutionSettings } from "./loadInstitutionSettings";
 
 export const generateDirectScoresheetTemplate = async (
   programId:      mongoose.Types.ObjectId,
@@ -17,7 +19,11 @@ export const generateDirectScoresheetTemplate = async (
   semester:       number,
   academicYearId: mongoose.Types.ObjectId,
   logoBuffer:     any,
-): Promise<Buffer> => {
+  distribution:   MarkDistribution | null = null,   // CA/exam split; null = unit default → 30/70
+  extraRegNos:    string[] = [],                    // students outside the main class to add to the sheet
+  unitType:       "theory" | "lab" | "workshop" = "theory",
+  examMode:       "standard" | "mandatory_q1" = "standard",
+ ): Promise<Buffer> => {
   const [program, unit, academicYear] = await Promise.all([
     Program.findById(programId).lean()           as Promise<any>,
     Unit.findById(unitId).lean()                 as Promise<any>,
@@ -45,7 +51,10 @@ export const generateDirectScoresheetTemplate = async (
   const eligibleStudents: ScoresheetStudent[] = await buildScoresheetStudentList({
     programId, programUnitId: programUnitDoc?._id ?? unitId,
     unitId, yearOfStudy, academicYearId, session, passMark,
+    extraRegNos, institutionId: program?.institution,
   });
+
+  const dist = resolveDistribution(distribution, unit?.markDistribution, unitType);
 
   const studentIds = eligibleStudents.map((s) => s.studentId);
   const marksMap   = programUnitDoc
@@ -70,7 +79,7 @@ export const generateDirectScoresheetTemplate = async (
 
   const cb = { alignment: { horizontal: "center" as const, vertical: "middle" as const }, font: { bold: true, name: fontName, underline: true } };
   const yrTxt  = ["FIRST","SECOND","THIRD","FOURTH","FIFTH"][yearOfStudy - 1] ?? `${yearOfStudy}TH`;
-  const semTxt = semester === 1 ? "FIRST" : "SECOND";
+  const semTxt = semesterWord(semester);
 
   sheet.mergeCells("C6:G6"); sheet.getCell("C6").value = universityName.toUpperCase();
   sheet.getCell("C6").style = { ...cb, font: { ...cb.font, size: 12 } };
@@ -81,10 +90,14 @@ export const generateDirectScoresheetTemplate = async (
   sheet.getCell("E12").value = "UNIT CODE:";  sheet.getCell("F12").value = unit.code;
   sheet.getRow(12).font = { name: fontName, bold: true, size: 9 };
 
+  // Hidden metadata so the uploaded sheet carries its own distribution / unit type / exam mode
+  sheet.getCell(META_CELL).value = encodeSheetMeta({ distribution: dist, unitType, examMode });
+  sheet.getColumn("Z").hidden = true;
+
   ["A","B","C","D","J"].forEach((col) => sheet.mergeCells(`${col}15:${col}16`));
 
   const hRow = sheet.getRow(15); hRow.height = 47;
-  ["S/N","REG. NO.","NAME",null,"CA TOTAL (/30)","EXAM TOTAL (/70)","INTERNAL (/100)","EXTERNAL (/100)","AGREED (/100)",null].forEach((h, i) => {
+  ["S/N","REG. NO.","NAME",null,`CA TOTAL (/${dist.ca})`,`EXAM TOTAL (/${dist.exam})`,"INTERNAL (/100)","EXTERNAL (/100)","AGREED (/100)",null].forEach((h, i) => {
     const cell = hRow.getCell(i + 1);
     cell.value = h; cell.font = { bold: true, name: fontName, size: 9 };
     cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true }; cell.border = thin;
@@ -92,7 +105,7 @@ export const generateDirectScoresheetTemplate = async (
   });
 
   const sRow = sheet.getRow(16);
-  [null,null,null,"ATTEMPT",30,70,100,100,100,"GRADE"].forEach((v, i) => {
+  [null,null,null,"ATTEMPT",dist.ca,dist.exam,100,100,100,"GRADE"].forEach((v, i) => {
     const cell = sRow.getCell(i + 1);
     cell.value = v; cell.font = { bold: true, name: fontName, size: 8 };
     cell.alignment = { vertical: "middle", horizontal: "center" }; cell.border = doubleBtm;
@@ -143,6 +156,9 @@ export const generateDirectScoresheetTemplate = async (
       const cell = row.getCell(c);
       cell.border = thin; cell.font = { name: fontName, size: 8 }; cell.alignment = { vertical: "middle" };
 
+      // Reg no / name / attempt stay editable so students outside the class can be typed into spare rows
+      if (c >= 2 && c <= 4) cell.protection = { locked: false };
+ 
       if (c === 5) {
         if (ss?.isSupp) {
           cell.fill       = greyFill;
@@ -159,12 +175,12 @@ export const generateDirectScoresheetTemplate = async (
         else {
           cell.fill = pinkFill;
           cell.protection = { locked: false };
-          cell.dataValidation = { type: "decimal", operator: "between", formulae: [0, 30], allowBlank: true, showErrorMessage: true, errorTitle: "Invalid CA", error: "0–30"};
-        }
+          cell.dataValidation = { type: "decimal", operator: "between", formulae: [0, dist.ca], allowBlank: true, showErrorMessage: true, errorTitle: "Invalid CA", error: `0–${dist.ca}`};
+         }
       } else if (c === 6) {
         cell.fill = purpleFill; cell.protection = { locked: false };
-        cell.dataValidation = { type: "decimal", operator: "between", formulae: [0, 70], allowBlank: true, showErrorMessage: true, errorTitle: "Invalid Exam", error: "0–70" };
-      } else if (c === 8) {
+        cell.dataValidation = { type: "decimal", operator: "between", formulae: [0, dist.exam], allowBlank: true, showErrorMessage: true, errorTitle: "Invalid Exam", error: `0–${dist.exam}` };
+       } else if (c === 8) {
         cell.protection = { locked: false };
         cell.dataValidation = { type: "decimal", operator: "between", formulae: [0, 100], allowBlank: true };
       } else if (c >= 7) { cell.fill = greyFill; cell.protection = { locked: true }; }

@@ -19,6 +19,9 @@ import { validateRegNo }          from "../utils/validateRegNo";
 import { loadInstitutionSettings } from "../utils/loadInstitutionSettings";
 import { loadLogoBuffer }          from "../utils/loadLogoBuffer";
 import { ApiError }               from "../middleware/errorHandler";
+import { getIntakeDefinitions, resolveAdmissionIntake } from "../utils/intakeDefinitions";
+import { intakeCodesOf } from "../utils/semesterLabels";
+import { loadExistingByBase, splitRegNo } from "../utils/regNoQualifier";
 import multer from "multer";
 import * as xlsxLib from "xlsx";
 
@@ -31,17 +34,20 @@ interface ProgramLean {
   code:          string;
   durationYears: number;
   degreeType:    string;
+  intakes?:      string[];
 }
 
 interface ProgramRef {
   _id:  mongoose.Types.ObjectId;
   code: string;
   name: string;
+  intakes?:      string[];
 }
 
 interface AcademicYearLean {
   _id:  mongoose.Types.ObjectId;
   year: string;
+  intakeSemesters?: Array<{ intake: string; semester: number }>;
 }
 
 // Reg-pattern shape from InstitutionSettings
@@ -182,7 +188,7 @@ router.get("/template",
           _id:         pid,
           institution: req.user.institution,
         })
-          .select("code name")
+          .select("code name intakes")
           .lean<ProgramRef>() ?? null;
       }
       if (selectedProgram) programs = [selectedProgram];
@@ -210,6 +216,12 @@ router.get("/template",
       .select("year")
       .lean<AcademicYearLean>();
     const currentYearString = yearDoc?.year ?? "General";
+
+    // Intakes offered in the template: the selected program's, else all the institution defines
+    const tplDefs    = await getIntakeDefinitions(req.user.institution);
+    const tplIntakes = selectedProgram?.intakes?.length
+      ? selectedProgram.intakes
+      : intakeCodesOf(tplDefs);
 
     // ── 5. Build workbook ─────────────────────────────────────────────────────
     const workbook  = new ExcelJS.Workbook();
@@ -277,14 +289,14 @@ router.get("/template",
     worksheet.mergeCells(`A${currentRow}:E${currentRow}`);
     const fmtCell  = worksheet.getCell(`A${currentRow}`);
     if (patternExample) {
-      fmtCell.value = `Reg No format for ${myDeptCode}: ${patternExample}${enforcePatterns ? " (enforced)" : " (reference)"}`;
+      fmtCell.value = `Reg No format for ${myDeptCode}: ${patternExample}${enforcePatterns ? " (enforced)" : " (reference)"} — Qualifier column is optional`;
       fmtCell.style = {
         alignment: { horizontal: "center" as const, vertical: "middle" as const },
         font:      { name: fontName, size: 9, color: { argb: "FF1E40AF" }, bold: true },
         fill:      { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FFDBEAFE" } },
       };
     } else {
-      fmtCell.value = "Fill in all columns. Reg No, Full Name, and Program are required.";
+      fmtCell.value = "Reg No, Full Name and Program are required. Qualifier (RP1, M2, TF2 …) is optional — leave blank if none.";
       fmtCell.style = {
         alignment: { horizontal: "center" as const, vertical: "middle" as const },
         font:      { name: fontName, size: 9, color: { argb: "FF6B7280" } },
@@ -301,9 +313,9 @@ router.get("/template",
     const headerRowNum = currentRow + 1;
     currentRow = headerRowNum;
     const headerRow = worksheet.getRow(headerRowNum);
-    ["Reg No", "Full Name", "Program", "Year of Study", "Intake"].forEach((h, i) => {
-      const cell = headerRow.getCell(i + 1);
-      cell.value = h;
+    ["Reg No", "Full Name", "Program", "Year of Study", "Intake", "Qualifier (optional)"].forEach((h, i) => {
+       const cell = headerRow.getCell(i + 1);
+       cell.value = h;
       cell.style = {
         font:      { bold: true, name: fontName, size: 10, color: { argb: "FFFFFFFF" } },
         fill:      { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FF1E3A5F" } },
@@ -328,7 +340,7 @@ router.get("/template",
       const row = worksheet.getRow(r);
       row.font  = { name: fontName, size: 10 };
 
-      for (let c = 1; c <= 5; c++) {
+      for (let c = 1; c <= 6; c++) {
         row.getCell(c).border = thinBorder;
       }
 
@@ -393,21 +405,21 @@ router.get("/template",
       // Col E — Intake
       const intakeCell = row.getCell(5);
       intakeCell.protection = { locked: false };
-      intakeCell.value      = "SEPT";    // sensible default
+      intakeCell.value      = tplIntakes[0];    // sensible default
       intakeCell.dataValidation = {
         type:        "list",
         allowBlank:  false,
-        formulae:    ['"JAN,MAY,SEPT"'],
+        formulae:    [`"${tplIntakes.join(",")}"`],
         showErrorMessage: true,
         errorTitle:  "Invalid Intake",
-        error:       "Intake must be JAN, MAY, or SEPT.",
+        error:  `Intake must be one of: ${tplIntakes.join(", ")}.`,
       };
     }
 
     // ── Alternate row shading for readability ─────────────────────────────────
     for (let r = dataStartRow; r <= dataEndRow; r += 2) {
       const row = worksheet.getRow(r);
-      for (let c = 1; c <= 5; c++) {
+      for (let c = 1; c <= 6; c++) {
         const cell = row.getCell(c);
         if (!cell.fill || (cell.fill as ExcelJS.FillPattern).type !== "pattern") {
           cell.fill = {
@@ -424,7 +436,8 @@ router.get("/template",
     worksheet.getColumn("C").width = 52;   // Program name — longest field
     worksheet.getColumn("D").width = 18;   // Year of Study
     worksheet.getColumn("E").width = 12;   // Intake
-
+    worksheet.getColumn("F").width = 20;   // Qualifier — optional (RP1, M2, TF2 …)
+    
     // ── Freeze header rows ────────────────────────────────────────────────────
     worksheet.views = [{ state: "frozen", ySplit: headerRowNum }];
 
@@ -476,7 +489,9 @@ router.post(
       academicYearId?:             string;
       intake?:                     string;
       admissionAcademicYearString?: string;
-    }
+     /** Optional — RP1, M2, TF2 … (may also be glued to regNo) */
+      qualifier?:                  string;
+     }
 
     const { students } = req.body as { students: BulkRow[] };
     if (!Array.isArray(students) || students.length === 0) {
@@ -487,13 +502,15 @@ router.post(
     const allowedProgramIds = await getScopedProgramIds(req);
 
     const incoming = students.map(s => ({
-      regNo:                       (s.regNo   ?? "").trim().toUpperCase(),
-      name:                        (s.name    ?? "").trim(),
-      rawProgram:                  (s.program ?? "").trim(),
-      normalizedProgram:           normalizeProgramName((s.program ?? "").trim()),
+      // Identity = base reg no. A qualifier typed into the reg no or the
+     // Qualifier column is split off and stored separately.
+      ...(() => { const sp = splitRegNo(s.regNo, s.qualifier); return { regNo: sp.base, qualifier: sp.qualifier }; })(),
+       name:                        (s.name    ?? "").trim(),
+       rawProgram:                  (s.program ?? "").trim(),
+       normalizedProgram:           normalizeProgramName((s.program ?? "").trim()),
       yearOfStudy:                 Number(s.currentYearOfStudy) || 1,
       academicYearId:              s.academicYearId,
-      intake:                      (s.intake ?? "SEPT").trim().toUpperCase(),
+      intake:                      (s.intake ?? "").trim().toUpperCase(),
       admissionAcademicYearString: s.admissionAcademicYearString ?? "2024/2025",
     }));
 
@@ -506,8 +523,9 @@ router.post(
       institution: institutionId,
       _id:         { $in: allowedProgramIds },
     })
-      .select("name code durationYears degreeType")
+      .select("name code durationYears degreeType intakes")
       .lean<ProgramLean[]>();
+    const intakeDefs = await getIntakeDefinitions(institutionId);  
 
     const programNameMap = new Map(dbPrograms.map(p => [normalizeProgramName(p.name), p]));
     const programIdMap   = new Map(dbPrograms.map(p => [p._id.toString(), p]));
@@ -556,21 +574,46 @@ router.post(
       resolvedYears.forEach(y => academicYearMap.set(y.year, y._id));
     }
 
-    const regNos    = incoming.map(s => s.regNo);
-    const existing  = await Student.find({ regNo: { $in: regNos }, institution: institutionId })
-      .select("regNo")
-      .lean<Array<{ regNo: string }>>();
-    const existingSet = new Set(existing.map(s => s.regNo));
+    // Intakes each academic year is configured to run (unconfigured years are not checked)
+    const yearIds = [
+      ...new Set([
+        ...incoming.map(s => s.academicYearId).filter((v): v is string => !!v && mongoose.Types.ObjectId.isValid(v)),
+        ...[...academicYearMap.values()].map(v => v.toString()),
+      ]),
+    ];
+    const yearDocs = yearIds.length
+      ? await AcademicYear.find({ _id: { $in: yearIds }, institution: institutionId })
+          .select("year intakeSemesters").lean<AcademicYearLean[]>()
+      : [];
+    const yearInfo = new Map(yearDocs.map(y => [
+      y._id.toString(),
+      { label: y.year, intakes: (y.intakeSemesters ?? []).map(m => m.intake) },
+    ]));
 
+    // Duplicate check on the BASE reg no — with or without qualifier it is the same student.
+    const existingByBase = await loadExistingByBase(Student, institutionId, incoming.map(s => s.regNo));
+    const seenInBatch    = new Set<string>();
+    
     const results = {
       registered: [] as string[],
       duplicates: [] as string[],
       errors:     [] as string[],
+      /** existing students that had no qualifier and received one from this upload */
+      qualifierUpdated: [] as string[],
     };
     const toCreate: Array<Record<string, unknown>> = [];
 
     for (const s of incoming) {
-      if (existingSet.has(s.regNo)) { results.duplicates.push(s.regNo); continue; }
+      const known = existingByBase.get(s.regNo);
+      if (known || seenInBatch.has(s.regNo)) {
+        results.duplicates.push(s.qualifier ? `${s.regNo}${s.qualifier}` : s.regNo);
+        if (known && s.qualifier && !known.qualifierSuffix) {
+          await Student.updateOne({ _id: known._id }, { $set: { qualifierSuffix: s.qualifier } });
+          results.qualifierUpdated.push(s.regNo);
+        }
+        continue;
+      }
+      seenInBatch.add(s.regNo);
 
       const progDoc = programIdMap.get(s.rawProgram) ?? programNameMap.get(s.normalizedProgram);
       if (!progDoc) { results.errors.push(`${s.regNo}: Program not found`); continue; }
@@ -602,10 +645,18 @@ router.post(
         finalYearId = resolved;
       }
 
+      const yInfo = yearInfo.get(finalYearId.toString());
+      const adm = resolveAdmissionIntake({
+        intakeRaw: s.intake, defs: intakeDefs, programName: progDoc.name,
+        programIntakes: progDoc.intakes, yearLabel: yInfo?.label,
+        yearConfiguredIntakes: yInfo?.intakes ?? null,
+      });
+      if ("error" in adm) { results.errors.push(`${s.regNo}: ${adm.error}`); continue; }
+
       toCreate.push({
-        regNo: s.regNo, name: s.name, institution: institutionId,
+        regNo: s.regNo, qualifierSuffix: s.qualifier, name: s.name, institution: institutionId,
         program: progDoc._id, programType, entryType,
-        intake: s.intake, currentYearOfStudy: s.yearOfStudy,
+        intake: adm.intake, currentYearOfStudy: s.yearOfStudy,
         admissionAcademicYear: finalYearId, status: "active",
       });
     }
@@ -766,8 +817,10 @@ router.post("/upload-excel",
       _id:         { $in: allowedProgramIds },
       isActive:    true,
     })
-      .select("name code durationYears degreeType")
+      .select("name code durationYears degreeType intakes")
       .lean<ProgramLean[]>();
+
+    const intakeDefs = await getIntakeDefinitions(institutionId);      
 
     const programByName = new Map(
       dbPrograms.map(p => [normalizeProgramName(p.name), p]),
@@ -781,8 +834,9 @@ router.post("/upload-excel",
       institution: institutionId,
       isCurrent:   true,
     })
-      .select("_id year")
+      .select("_id year intakeSemesters")
       .lean<AcademicYearLean>();
+    const currentYearIntakes = (currentYear?.intakeSemesters ?? []).map(m => m.intake);
 
     // ── Process rows ──────────────────────────────────────────────────────────
     const results = {
@@ -790,17 +844,20 @@ router.post("/upload-excel",
       duplicates: [] as string[],
       errors:     [] as string[],
       skipped:    0,
+      /** existing students that had no qualifier and received one from this file */
+      qualifierUpdated: [] as string[],
     };
 
     const toCreate: Array<Record<string, unknown>> = [];
     const regNosToCreate: string[] = [];
 
     for (const [i, row] of dataRows.entries()) {
-      const regNo   = String(row[0] ?? "").trim().toUpperCase();
-      const name    = String(row[1] ?? "").trim();
+      // Base reg no + optional qualifier (column F, or glued onto the reg no)
+      const { base: regNo, qualifier } = splitRegNo(row[0], row[5]);
+       const name    = String(row[1] ?? "").trim();
       const progRaw = String(row[2] ?? "").trim();
       const yearRaw = parseInt(String(row[3] ?? "1")) || 1;
-      const intake  = String(row[4] ?? "SEPT").trim().toUpperCase();
+      const intake  = String(row[4] ?? "").trim().toUpperCase();
 
       // Blank rows — skip silently
       if (!regNo && !name) { results.skipped++; continue; }
@@ -834,7 +891,17 @@ router.post("/upload-excel",
         continue;
       }
 
-      const safeIntake = ["JAN","MAY","SEPT"].includes(intake) ? intake : "SEPT";
+      const adm = resolveAdmissionIntake({
+                intakeRaw: intake, defs: intakeDefs, programName: progDoc.name,
+                programIntakes: progDoc.intakes, yearLabel: currentYear?.year,
+                yearConfiguredIntakes: currentYearIntakes,
+              });
+              if ("error" in adm) {
+                results.errors.push(`Row ${rowNum} (${regNo}): ${adm.error}`);
+                continue;
+              }
+      const safeIntake = adm.intake;
+
       const entryType  =
         yearRaw === 2 ? "Mid-Entry-Y2" :
         yearRaw === 3 ? "Mid-Entry-Y3" :
@@ -842,37 +909,43 @@ router.post("/upload-excel",
 
       toCreate.push({
         regNo,
+        qualifierSuffix: qualifier,
         name,
-        institution:          institutionId,
-        program:              progDoc._id,
-        programType:          progDoc.degreeType ?? "BSc",
+        institution: institutionId,
+        program: progDoc._id,
+        programType: progDoc.degreeType ?? "BSc",
         entryType,
-        intake:               safeIntake,
-        currentYearOfStudy:   yearRaw,
+        intake: safeIntake,
+        currentYearOfStudy: yearRaw,
         admissionAcademicYear: currentYear?._id,
-        status:               "active",
+        status: "active",
       });
       regNosToCreate.push(regNo);
     }
 
     // ── Batch duplicate check ─────────────────────────────────────────────────
     if (regNosToCreate.length > 0) {
-      const existing = await Student.find({
-        regNo:       { $in: regNosToCreate },
-        institution: institutionId,
-      })
-        .select("regNo")
-        .lean<Array<{ regNo: string }>>();
-
-      const existingSet = new Set(existing.map(s => s.regNo));
-
-      const newStudents = toCreate.filter(s => {
-        if (existingSet.has(s.regNo as string)) {
-          results.duplicates.push(s.regNo as string);
-          return false;
-        }
-        return true;
-      });
+     
+      // Keyed on the BASE reg no: with or without qualifier = same student.
+            const existingByBase = await loadExistingByBase(Student, institutionId, regNosToCreate);
+            const seenInFile     = new Set<string>();
+      
+            const newStudents: Array<Record<string, unknown>> = [];
+            for (const s of toCreate) {
+              const base      = s.regNo as string;
+              const qualifier = (s.qualifierSuffix as string) || "";
+              const known     = existingByBase.get(base);
+              if (known || seenInFile.has(base)) {
+                results.duplicates.push(`${base}${qualifier}`);
+                if (known && qualifier && !known.qualifierSuffix) {
+                  await Student.updateOne({ _id: known._id }, { $set: { qualifierSuffix: qualifier } });
+                  results.qualifierUpdated.push(base);
+                }
+                continue;
+              }
+              seenInFile.add(base);
+              newStudents.push(s);
+            }
 
       if (newStudents.length > 0) {
         try {
@@ -913,7 +986,7 @@ router.post("/upload-excel",
       results.errors.length;
 
     res.status(207).json({
-      message: `${results.registered.length} registered, ${results.duplicates.length} already exist, ${results.errors.length} errors from ${total} rows.`,
+      message: `${results.registered.length} registered, ${results.duplicates.length} already exist${results.qualifierUpdated.length ? ` (${results.qualifierUpdated.length} qualifier(s) added)` : ""}, ${results.errors.length} errors from ${total} rows.`,
       ...results,
     });
   }),

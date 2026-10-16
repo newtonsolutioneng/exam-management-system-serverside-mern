@@ -26,6 +26,25 @@ import { loadLogoBuffer } from "../utils/loadLogoBuffer";
 import { randomUUID } from "node:crypto";
 import Program from "../models/Program";
 import { getScopedProgramIds } from "../middleware/auth";
+import Student from "../models/Student";
+import ProblemResult from "../models/ProblemResult";
+import ProgramUnit from "../models/ProgramUnit";
+import FinalGrade from "../models/FinalGrade";
+import { retryProblems } from "../services/resultUpload";
+import { buildDisplayRegNo } from "../utils/academicRules";
+import { parseDistribution } from "../utils/markDistribution";
+import { cleanRegNo, loadExistingByBase, splitRegNo } from "../utils/regNoQualifier";
+
+/** "E024-01-1/2024, E024-01-2/2024\nE024-01-3/2024" → clean reg nos */
+const parseRegNoList = (v: unknown): string[] =>
+  [...new Set(String(v ?? "").split(/[\s,;]+/).map(cleanRegNo).filter(Boolean))].slice(0, 200);
+
+/** Reads ?caMax=&examMax= ; null = use the unit default. Throws a 400-able Error. */
+function distributionFromQuery(q: Record<string, unknown>) {
+  const parsed = parseDistribution({ caMax: q.caMax, examMax: q.examMax });
+  if ("error" in parsed) throw new Error(`invalid: ${parsed.error}`);
+  return parsed.distribution;
+}
 
 const router = Router();
 
@@ -74,6 +93,16 @@ router.get("/template", requireAuth,
       const institutionId = req.user.institution.toString();
       const logoBuffer    = await loadLogoBuffer(institutionId);
 
+      const distribution = distributionFromQuery(req.query);
+      const extraRegNos  = parseRegNoList(req.query.extraRegNos);
+      if (distribution && req.query.saveDistribution === "true") {
+        await Unit.updateOne({ _id: unitId }, { $set: { markDistribution: distribution } });
+      }
+      if (extraRegNos.length) {
+        const known = await loadExistingByBase(Student, institutionId, extraRegNos.map((r) => splitRegNo(r).base));
+        const unknown = extraRegNos.filter((r) => !known.has(splitRegNo(r).base));
+        if (unknown.length) res.header("X-Unknown-RegNos", encodeURIComponent(unknown.join(",")));
+      }
 
       const excelBuffer = await generateFullScoresheetTemplate(
         new mongoose.Types.ObjectId(programId as string),
@@ -84,12 +113,14 @@ router.get("/template", requireAuth,
         logoBuffer,
         examMode as string,
         (unitType as any) || "theory",
+        distribution,
+        extraRegNos,
       );
 
       res
         .header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        .header("Access-Control-Expose-Headers", "Content-Disposition")
-        .attachment(fileName)
+        .header("Access-Control-Expose-Headers", "Content-Disposition, X-Unknown-RegNos")
+         .attachment(fileName)
         .send(excelBuffer);
     } catch (error: any) {
       console.error("[GET /marks/template] Error:", error.message, error.stack);
@@ -116,7 +147,7 @@ router.get("/template", requireAuth,
 router.get("/direct-template", requireAuth,
   requireRole("coordinator", "admin"),
   asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-    const { programId, unitId, academicYearId, yearOfStudy, semester } = req.query;
+    const { programId, unitId, academicYearId, yearOfStudy, semester, examMode, unitType } = req.query;
 
     if (!programId || !unitId || !academicYearId || !yearOfStudy || !semester) {
       return res.status(400).json({
@@ -155,6 +186,16 @@ router.get("/direct-template", requireAuth,
       const institutionId = req.user.institution.toString();
       const logoBuffer = await loadLogoBuffer(institutionId);
       
+      const distribution = distributionFromQuery(req.query);
+      const extraRegNos  = parseRegNoList(req.query.extraRegNos);
+      if (distribution && req.query.saveDistribution === "true") {
+        await Unit.updateOne({ _id: unitId }, { $set: { markDistribution: distribution } });
+      }
+      if (extraRegNos.length) {
+        const known = await loadExistingByBase(Student, institutionId, extraRegNos.map((r) => splitRegNo(r).base));
+        const unknown = extraRegNos.filter((r) => !known.has(splitRegNo(r).base));
+        if (unknown.length) res.header("X-Unknown-RegNos", encodeURIComponent(unknown.join(",")));
+      }
 
       const buffer = await generateDirectScoresheetTemplate(
         new mongoose.Types.ObjectId(programId as string),
@@ -163,11 +204,15 @@ router.get("/direct-template", requireAuth,
         parseInt(semester as string, 10),
         new mongoose.Types.ObjectId(academicYearId as string),
         logoBuffer,
+        distribution,
+        extraRegNos,
+        (["theory", "lab", "workshop"].includes(String(unitType)) ? unitType : "theory") as "theory" | "lab" | "workshop",
+        examMode === "mandatory_q1" ? "mandatory_q1" : "standard",
       );
 
       res
         .header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        .header("Access-Control-Expose-Headers", "Content-Disposition")
+        .header("Access-Control-Expose-Headers", "Content-Disposition, X-Unknown-RegNos")
         .attachment(fileName)
         .send(buffer);
     } catch (error: any) {
@@ -739,5 +784,146 @@ router.delete(
     });
   }),
 );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACTION LIST — rows that could not be applied during an upload
+// ─────────────────────────────────────────────────────────────────────────────
+const coordinatorOnly = [requireAuth, requireRole("coordinator", "admin")] as const;
+
+// GET /marks/problems?status=OPEN|RESOLVED|DISMISSED|ALL&academicYearId=
+router.get("/problems", ...coordinatorOnly, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const institution = req.user.institution;
+  const status = String(req.query.status ?? "OPEN").toUpperCase();
+  const filter: Record<string, unknown> = { institution };
+  if (status !== "ALL") filter.status = status;
+  if (req.query.academicYearId && mongoose.Types.ObjectId.isValid(String(req.query.academicYearId))) {
+    filter.academicYear = req.query.academicYearId;
+  }
+  const items = await ProblemResult.find(filter)
+    .select("-payload")
+    .populate("program", "name code")
+    .sort({ academicYearLabel: -1, unitCode: 1, rowNumber: 1 })
+    .limit(1000)
+    .lean();
+  const byCode: Record<string, number> = {};
+  for (const i of items) byCode[i.code] = (byCode[i.code] ?? 0) + 1;
+  res.json({ total: items.length, byCode, items });
+}));
+
+// POST /marks/problems/retry  { ids?: string[] } — re-apply (all open when no ids)
+router.post("/problems/retry", ...coordinatorOnly, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const ids = Array.isArray(req.body?.ids) ? (req.body.ids as string[]).filter((i) => mongoose.Types.ObjectId.isValid(i)) : undefined;
+  const out = await retryProblems({ institutionId: req.user.institution, userId: req.user._id, ids });
+  await logAudit(req, { action: "marks_problems_retry", details: out });
+  res.json({ message: `${out.resolved} of ${out.attempted} result(s) applied; ${out.stillOpen} still need action.`, ...out });
+}));
+
+// POST /marks/problems/:id/resolve  { regNo } — fix the reg no of one row and apply it
+router.post("/problems/:id/resolve", ...coordinatorOnly, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ message: "Invalid id." });
+  const regNo = String(req.body?.regNo ?? "").trim();
+  if (!regNo) return res.status(400).json({ message: "regNo is required." });
+  const out = await retryProblems({ institutionId: req.user.institution, userId: req.user._id, ids: [req.params.id], override: { regNo } });
+  await logAudit(req, { action: "marks_problem_resolve", details: { id: req.params.id, regNo, ...out } });
+  if (!out.attempted) return res.status(404).json({ message: "Open problem not found." });
+  const p = await ProblemResult.findById(req.params.id).select("-payload").lean();
+  res.status(out.resolved ? 200 : 422).json({ message: out.resolved ? "Result applied." : (p?.message ?? "Still cannot be applied."), problem: p });
+}));
+
+// POST /marks/problems/:id/dismiss  { note? } — coordinator decides the row is not needed
+router.post("/problems/:id/dismiss", ...coordinatorOnly, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ message: "Invalid id." });
+  const p = await ProblemResult.findOneAndUpdate(
+    { _id: req.params.id, institution: req.user.institution, status: "OPEN" },
+    { $set: { status: "DISMISSED", resolvedAt: new Date(), resolvedBy: req.user._id, resolution: String(req.body?.note ?? "Dismissed by coordinator").slice(0, 300) } },
+    { new: true },
+  ).select("-payload").lean();
+  if (!p) return res.status(404).json({ message: "Open problem not found." });
+  await logAudit(req, { action: "marks_problem_dismiss", details: { id: req.params.id, regNo: p.regNo, unit: p.unitCode } });
+  res.json({ message: "Dismissed.", problem: p });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /marks/cms-preview?programId&academicYearId&yearOfStudy
+// How the CMS is building up: students × units of that year of study, filled from uploaded
+// results, with what is still missing and which action-list items are open.
+// ─────────────────────────────────────────────────────────────────────────────
+const CMS_EXCLUDED = ["deregistered", "discontinued", "graduated", "graduand", "deferred", "on_leave"];
+
+router.get("/cms-preview", ...coordinatorOnly, asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  const { programId, academicYearId } = req.query as Record<string, string>;
+  const yearOfStudy = parseInt(String(req.query.yearOfStudy ?? ""), 10);
+  if (![programId, academicYearId].every((v) => v && mongoose.Types.ObjectId.isValid(v)) || !(yearOfStudy >= 1)) {
+    return res.status(400).json({ message: "programId, academicYearId and yearOfStudy are required." });
+  }
+  const institution = req.user.institution;
+  const allowed = (await getScopedProgramIds(req)).map(String);
+  if (!allowed.includes(programId)) return res.status(403).json({ message: "Programme is outside your scope." });
+
+  const [programUnits, academicYear] = await Promise.all([
+    ProgramUnit.find({ program: programId, requiredYear: yearOfStudy })
+      .populate("unit", "code name").sort({ requiredSemester: 1 }).lean(),
+    AcademicYear.findById(academicYearId).select("year session").lean(),
+  ]);
+  if (!academicYear) return res.status(404).json({ message: "Academic year not found." });
+  const puIds = programUnits.map((p) => p._id);
+
+  const [grades, directs, details] = await Promise.all([
+    FinalGrade.find({ academicYear: academicYearId, programUnit: { $in: puIds } }).sort({ updatedAt: 1 }).lean(),
+    MarkDirect.find({ academicYear: academicYearId, programUnit: { $in: puIds } }).select("student programUnit agreedMark attempt").lean(),
+    Mark.find({ academicYear: academicYearId, programUnit: { $in: puIds } }).select("student programUnit agreedMark attempt").lean(),
+  ]);
+
+  // class = the programme's students in this year of study + anybody who has a result for these units
+  const withResults = new Set<string>([...grades, ...directs, ...details].map((g: any) => String(g.student)));
+  const students = (await Student.find({
+    program: programId,
+    status: { $nin: CMS_EXCLUDED },
+    $or: [{ currentYearOfStudy: yearOfStudy }, { _id: { $in: [...withResults] } }],
+  }).select("regNo name qualifierSuffix status currentYearOfStudy").sort({ regNo: 1 }).limit(600).lean()) as any[];
+
+  type Cell = { mark: number; grade?: string; status?: string; attempt?: string };
+  const cell = new Map<string, Cell>();
+  for (const m of [...details, ...directs] as any[]) {
+    cell.set(`${m.student}_${m.programUnit}`, { mark: Number(m.agreedMark ?? 0), attempt: m.attempt });
+  }
+  for (const g of grades as any[]) {          // graded result wins over the raw mark
+    cell.set(`${g.student}_${g.programUnit}`, { mark: Number(g.totalMark ?? 0), grade: g.grade, status: g.status, attempt: g.attemptType });
+  }
+
+  const unitCols = programUnits.map((p: any) => ({
+    id: String(p._id), code: p.unit?.code ?? "N/A", name: p.unit?.name ?? "", semester: p.requiredSemester, isElective: !!p.isElective,
+    uploaded: 0, expected: students.length,
+  }));
+  let missing = 0, failed = 0, filled = 0;
+  const rows = students.map((s) => {
+    const cells: Record<string, Cell | null> = {};
+    let rowMissing = 0, rowFailed = 0;
+    unitCols.forEach((u) => {
+      const c = cell.get(`${s._id}_${u.id}`) ?? null;
+      cells[u.id] = c;
+      if (!c) { if (!u.isElective) rowMissing++; }
+      else { u.uploaded++; filled++; if (c.status === "SUPPLEMENTARY" || c.status === "RETAKE") rowFailed++; }
+    });
+    missing += rowMissing; failed += rowFailed;
+    return { id: String(s._id), regNo: buildDisplayRegNo(s.regNo, s.qualifierSuffix), name: s.name, status: s.status, cells, missing: rowMissing, failed: rowFailed };
+  });
+
+  const unitCodes = unitCols.map((u) => u.code);
+  const problems = await ProblemResult.find({ institution, status: "OPEN", academicYear: academicYearId, unitCode: { $in: unitCodes } })
+    .select("regNo unitCode code message action").limit(100).lean();
+  const openInYear = await ProblemResult.countDocuments({ institution, status: "OPEN", academicYear: academicYearId });
+
+  res.json({
+    academicYear: academicYear.year, session: (academicYear as any).session ?? "ORDINARY", yearOfStudy,
+    units: unitCols, students: rows,
+    summary: {
+      students: rows.length, units: unitCols.length, filled, missing, failed,
+      openProblemsForUnits: problems.length, openProblemsInYear: openInYear,
+      ready: missing === 0 && openInYear === 0 && rows.length > 0,
+    },
+    problems,
+  });
+}));
 
 export default router;

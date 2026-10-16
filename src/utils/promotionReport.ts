@@ -6,6 +6,7 @@ import { AwardListEntry } from "../services/graduationEngine";
 import { loadInstitutionSettings } from "./loadInstitutionSettings";
 import { loadLogoBuffer } from "./loadLogoBuffer";
 import { IDocumentMeta } from "../models/InstitutionSettings";
+import { displayRegNo } from "./regNoQualifier";
 
 
 export interface PromotionData {
@@ -446,7 +447,7 @@ function createSpecialUnitDetailTable(students: any[], cellMargin: any): Table {
               }),
               new TableCell({
                 margins:  cellMargin,
-                children: [new Paragraph({ children: [new TextRun({ text: idx === 0 ? s.regNo : "", size: 18 })] })],
+                children: [new Paragraph({ children: [new TextRun({ text: idx === 0 ? displayRegNo(s.regNo, s.qualifierSuffix) : "", size: 18 })] })],
               }),
               new TableCell({
                 margins:  cellMargin,
@@ -471,7 +472,7 @@ function createSpecialUnitDetailTable(students: any[], cellMargin: any): Table {
         new TableRow({
           children: [
             new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: String(counter), size: 18 })] })] }),
-            new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: s.regNo, size: 18 })] })] }),
+            new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: displayRegNo(s.regNo, s.qualifierSuffix), size: 18 })] })] }),
             new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: (s.name || "").toUpperCase(), size: 18 })] })] }),
             new TableCell({ margins: cellMargin, columnSpan: 2, children: [new Paragraph({ children: [new TextRun({ text: "Special exam — unit details pending confirmation.", size: 18, italics: true })] })] }),
           ],
@@ -636,7 +637,7 @@ export const generateAcademicLeaveDoc = async (
   });
 
   const formattedList = list.map((s) => ({
-    regNo: s.regNo || "N/A",
+    regNo: s.regNo ? displayRegNo(s.regNo, s.qualifierSuffix) : "N/A",
     name: s.name || "N/A",
     effectiveDate: s.academicLeavePeriod?.startDate ? new Date(s.academicLeavePeriod.startDate).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : "N/A",
     remarks: s.remarks?.includes(":") ? s.remarks.split(":")[1].trim() : s.remarks || "Approved",
@@ -693,7 +694,7 @@ function createAdministrativeTable(students: any[], cellMargin: any) {
           new TableRow({
             children: [
               new TableCell({ margins: cellMargin, children: [ new Paragraph({ children: [ new TextRun({ text: (i + 1).toString(), size: 18 }) ] }) ] }),
-              new TableCell({ margins: cellMargin, children: [ new Paragraph({ children: [new TextRun({ text: s.regNo, size: 18 })] }) ]}),
+              new TableCell({ margins: cellMargin, children: [ new Paragraph({ children: [new TextRun({ text: displayRegNo(s.regNo, s.qualifierSuffix), size: 18 })] }) ]}),
               new TableCell({ margins: cellMargin, children: [ new Paragraph({ children: [new TextRun({ text: s.name, size: 18 })] }) ]}),
               new TableCell({ margins: cellMargin, children: [ new Paragraph({ children: [ new TextRun({ text: s.effectiveDate || "N/A", size: 18 })]}) ]}),
               new TableCell({ margins: cellMargin, children: [ new Paragraph({ children: [ new TextRun({ text: s.remarks || "Approved", size: 18 })]}) ]}),
@@ -881,7 +882,7 @@ function createStandardUnitDetailTable(students: any[], cellMargin: any, filterK
       rows.push(new TableRow({
         children: [
           new TableCell({ margins: cellMargin, children: [new Paragraph({ text: studentCounter.toString() })] }),
-          new TableCell({ margins: cellMargin, children: [new Paragraph({ text: s.regNo })] }),
+          new TableCell({ margins: cellMargin, children: [new Paragraph({ text: displayRegNo(s.regNo, s.qualifierSuffix) })] }),
           new TableCell({ margins: cellMargin, children: [new Paragraph({ text: s.name })] }),
           new TableCell({ margins: cellMargin, columnSpan: 2, children: [new Paragraph({ text: "Refer to individual transcript for unit details." })] }),
         ]
@@ -1063,7 +1064,7 @@ export const generateDefermentDoc = async (data: PromotionData): Promise<Buffer>
   const cellMargin = { top: 100, bottom: 100, left: 100, right: 100 };
 
   const formattedList = list.map((s) => ({
-    regNo: s.regNo || "N/A", name:  s.name  || "N/A",
+    regNo: s.regNo ? displayRegNo(s.regNo, s.qualifierSuffix) : "N/A", name:  s.name  || "N/A",
     effectiveDate: s.academicLeavePeriod?.startDate ? new Date(s.academicLeavePeriod.startDate).toLocaleDateString("en-GB", {day: "2-digit", month: "short", year: "numeric"}) : "N/A",
     endDate: s.academicLeavePeriod?.endDate ? new Date(s.academicLeavePeriod.endDate).toLocaleDateString("en-GB", {day: "2-digit", month: "short", year: "numeric"}) : "N/A",
     remarks: s.remarks?.includes(":") ? s.remarks.split(":")[1].trim() : s.remarks || "Approved",
@@ -1456,7 +1457,7 @@ export const generateSimpleAwardListDoc = async (data: {
               new TableRow({
                 children: [
                   new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: String(i + 1), size: 20 })] })] }),
-                  new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: s.regNo,             size: 20 })] })] }),
+                  new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: s.regNo, size: 20 })] })] }),
                   new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: formatStudentName(s.name), size: 20 })] })] }),
                 ],
               })

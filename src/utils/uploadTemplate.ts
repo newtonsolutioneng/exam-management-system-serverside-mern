@@ -5,6 +5,7 @@ import * as ExcelJS from "exceljs";
 import Program from "../models/Program";
 import Unit from "../models/Unit";
 import AcademicYear from "../models/AcademicYear";
+import { semesterWord } from "./semesterLabels";
 import ProgramUnit from "../models/ProgramUnit";
 import InstitutionSettings from "../models/InstitutionSettings";
 import config from "../config/config";
@@ -16,6 +17,7 @@ import {
   ScoresheetStudent,
 } from "./scoresheetStudentList";
 import { loadInstitutionSettings } from "./loadInstitutionSettings";
+import { MarkDistribution, resolveDistribution, unitWeights, encodeSheetMeta, META_CELL } from "./markDistribution";
 
 export const generateFullScoresheetTemplate = async (
   programId:      mongoose.Types.ObjectId,
@@ -26,7 +28,9 @@ export const generateFullScoresheetTemplate = async (
   logoBuffer:     any,
   examMode:       string = "standard",
   unitType:       "theory" | "lab" | "workshop" = "theory",
-): Promise<Buffer> => {
+  distribution:   MarkDistribution | null = null,   // CA/exam split; null = unit default → 30/70 (workshop 40/60)
+  extraRegNos:    string[] = [],                    // students outside the main class to add to the sheet
+ ): Promise<Buffer> => {
 
   // ── Metadata ──────────────────────────────────────────────────────────────
   const [program, unit, academicYear] = await Promise.all([
@@ -65,6 +69,8 @@ export const generateFullScoresheetTemplate = async (
     academicYearId,
     session,
     passMark: settings.passMark || 40,
+    extraRegNos,
+    institutionId: program?.institution,
   });
 
   // ── Pre-existing detailed marks for special CA pre-population ─────────────
@@ -77,14 +83,10 @@ export const generateFullScoresheetTemplate = async (
   const isMandatoryQ1 = examMode === "mandatory_q1";
   const q1Max         = isMandatoryQ1 ? 30 : 10;
 
-  const weights = {
-    practical:  unitType === "lab"      ? 15 : unitType === "workshop" ? 40 : 0,
-    assignment: unitType === "lab"      ? 5  : unitType === "theory"   ? 10 : 0,
-    tests:      unitType === "lab"      ? 10 : unitType === "theory"   ? 20 : 0,
-    exam:       unitType === "workshop" ? 60 : 70,
-  };
-  const caWeightTotal = 100 - weights.exam;
-  const rawPaperMax   = 70;
+  const dist    = resolveDistribution(distribution, unit?.markDistribution, unitType);
+  const weights = unitWeights(unitType, dist);
+  const caWeightTotal = dist.ca;
+   const rawPaperMax   = 70;
 
   // ── Column headers ────────────────────────────────────────────────────────
   const headers = ["S/N", "REG. NO.", "NAME", "ATTEMPT", "CAT 1", "CAT 2", "CAT 3", "AVG CAT", "ASSGNT 1", "ASSGNT 2", "ASSGNT 3", "AVG ASSGNT", "PRACTICAL", `CA TOTAL (${caWeightTotal}%)`, `Q1 (/${q1Max})`, "Q2", "Q3", "Q4", "Q5", `EXAM (${weights.exam}%)`, "INTERNAL (/100)", "EXTERNAL (/100)", "AGREED (/100)", "GRADE"];
@@ -140,7 +142,7 @@ export const generateFullScoresheetTemplate = async (
   sheet.getCell("D7").value = `DEGREE: ${program?.name.toUpperCase() || ""}`;
   sheet.getCell("D7").style = centerBold;
 
-  const semTxt = semester === 1 ? "FIRST" : "SECOND";
+  const semTxt = semesterWord(semester);
   const yrTxt  = ["FIRST","SECOND","THIRD","FOURTH","FIFTH"][yearOfStudy - 1] || `${yearOfStudy}TH`;
 
   sheet.mergeCells("D8:Q8");
@@ -162,6 +164,13 @@ export const generateFullScoresheetTemplate = async (
   sheet.mergeCells("L12:M12"); sheet.getCell("L12").value = "UNIT TITLE:";
   sheet.getCell("N12").value = unit?.name.toUpperCase();
   sheet.getRow(12).font = { name: fontName, bold: true, size: fontSize };
+
+  // Hidden metadata: the sheet carries its own distribution / unit type / exam mode so the
+  // upload never has to guess (read back by marksImporter).
+  sheet.getCell(META_CELL).value = encodeSheetMeta({
+    distribution: dist, unitType, examMode: isMandatoryQ1 ? "mandatory_q1" : "standard",
+  });
+  sheet.getColumn("Z").hidden = true;
 
   // ── Table group headers (row 14) ──────────────────────────────────────────
   sheet.mergeCells("A14:A15"); sheet.mergeCells("B14:B15");

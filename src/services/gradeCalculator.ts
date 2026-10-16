@@ -61,6 +61,8 @@ export async function computeFinalGrade({ markId, session }: ComputeOptions) {
     unitType: unitType,
     examMode: (markDoc.examMode as any) || "standard",
     attempt:  markDoc.attempt || "1st",
+    caMax:    markDoc.caMax,
+    examMax:  markDoc.examMax,
     settings: {
       catMax: catMax,
       assMax: assignmentMax,

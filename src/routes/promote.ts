@@ -24,6 +24,7 @@ import Student from "../models/Student";
 import { logAudit } from "../lib/auditLogger";
 import ProgramUnit from "../models/ProgramUnit";
 import Mark from "../models/Mark";
+import ProblemResult from "../models/ProblemResult";
 import { generateConsolidatedMarkSheet, ConsolidatedData } from "../utils/consolidatedMS";
 import MarkDirect from "../models/MarkDirect";
 import { undoPromotion } from "../services/undoPromotion";
@@ -342,6 +343,22 @@ router.post(
         year: academicYearName,
       }).lean();
       const targetAcadYearId = (academicYearDoc as any)?._id?.toString();
+
+      // Results waiting on the coordinator's action list must be dealt with (or knowingly skipped
+            // with force=true) before a CMS is generated from incomplete data.
+            if (targetAcadYearId && !req.body.force) {
+              const openProblems = await ProblemResult.countDocuments({
+                institution: req.user.institution, status: "OPEN", academicYear: targetAcadYearId,
+              });
+              if (openProblems > 0) {
+                res.write(`data: ${JSON.stringify({
+                  error: `${openProblems} uploaded result(s) still need action (Upload Results → Action list).`,
+                  code: "OPEN_PROBLEM_RESULTS", count: openProblems,
+                })}\n\n`);
+                res.end();
+                return;
+              }
+            }
 
       const sessionExamType: "ORDINARY" | "SUPPLEMENTARY" =
         (academicYearDoc as any)?.session === "SUPPLEMENTARY"

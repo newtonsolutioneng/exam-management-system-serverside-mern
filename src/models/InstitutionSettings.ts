@@ -31,6 +31,7 @@
 
 // serverside/src/models/InstitutionSettings.ts
 import mongoose, { Schema, Document } from "mongoose";
+import { INTAKE_CODE_REGEX, type IntakeDefinition } from "../utils/semesterLabels";
 
 // Kenyan universities use A/B/C/D/E letter grades only.
 // No GPA points. Classification is determined by WAA ranges.
@@ -146,7 +147,8 @@ export interface IInstitutionSettings extends Document {
   // WAA-based degree classification — separate from per-unit grading
   waaClassification:  IWAAClassification[];
   branding:           IBrandingAssets;
-  supportedIntakes:   ("JAN" | "MAY" | "SEPT")[];
+  supportedIntakes:   string[];
+  intakeDefinitions:  IntakeDefinition[];
   enforceRegNoPattern: boolean;
   createdAt:          Date;
   updatedAt:          Date;
@@ -281,9 +283,19 @@ const InstitutionSettingsSchema = new Schema<IInstitutionSettings>(
     waaClassification:  { type: [WAAClassificationSchema], default: [] },
     branding:           { type: BrandingSchema, default: () => ({}) },
     supportedIntakes: {
-      type:    [String],
-      enum:    ["JAN","MAY","SEPT"],
-      default: ["SEPT"],
+      type:    [{ type: String, match: INTAKE_CODE_REGEX }],
+       default: ["SEPT"],
+     },
+    intakeDefinitions: {
+      type: [new Schema(
+        {
+          code:            { type: String, required: true, uppercase: true, trim: true, match: INTAKE_CODE_REGEX },
+          label:           { type: String, required: true, trim: true, maxlength: 40 },
+          defaultSemester: { type: Number, enum: [1, 2, 3], required: true, default: 1 },
+        },
+        { _id: false },
+      )],
+      default: [],
     },
     enforceRegNoPattern: { type: Boolean, default: false },
   },

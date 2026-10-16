@@ -1,5 +1,6 @@
 // src/models/Student.ts
 import mongoose, { Schema, Document } from "mongoose";
+import { INTAKE_CODE_REGEX } from "../utils/semesterLabels";
 import type { CarryForwardUnit } from "../services/carryForwardTypes";
 
 export interface IStudent extends Document {
@@ -37,7 +38,7 @@ const schema = new Schema<IStudent>({
   currentSemester:       { type: Number, default: 1 },
   remarks:               { type: String },
   admissionAcademicYear: { type: Schema.Types.ObjectId, ref: "AcademicYear", required: true },
-  intake:                { type: String, required: true, enum: ["JAN","MAY","SEPT"], uppercase: true, default: "SEPT" },
+  intake:                { type: String, required: true, match: INTAKE_CODE_REGEX, uppercase: true, default: "SEPT" },
   status:                { type: String, default: "active" },
   qualifierSuffix:       { type: String, default: "" },
 

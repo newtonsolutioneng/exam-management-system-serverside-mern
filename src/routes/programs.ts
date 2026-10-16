@@ -526,6 +526,28 @@ import { logAudit } from "../lib/auditLogger";
 import type { AuthenticatedRequest } from "../middleware/auth";
 import { cached, invalidateCache } from "../utils/cache";
 import { normalizeProgramName } from "../services/programNormalizer";
+import Student from "../models/Student";
+import { getIntakeDefinitions } from "../utils/intakeDefinitions";
+import { normalizeIntake, intakeCodesOf, type IntakeDefinition } from "../utils/semesterLabels";
+
+/** Validates a program's intake list against the institution's definitions. */
+function cleanProgramIntakes(raw: unknown, defs: IntakeDefinition[]): string[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw { statusCode: 400, message: "Select at least one intake for the program." } as ApiError;
+  }
+  const out: string[] = [];
+  for (const r of raw) {
+    const code = normalizeIntake(r, defs);
+    if (!code) {
+      throw {
+        statusCode: 400,
+        message: `Unknown intake "${String(r)}". Defined intakes: ${intakeCodesOf(defs).join(", ")}.`,
+      } as ApiError;
+    }
+    if (!out.includes(code)) out.push(code);
+  }
+  return out;
+}
 
 interface ApiError {
   statusCode: number;
@@ -546,6 +568,7 @@ router.post("/", requireAuth,
       degreeType,
       schoolCode,
       departmentCode,
+      intakes,
     } = req.body as {
       name: string;
       code: string;
@@ -554,6 +577,7 @@ router.post("/", requireAuth,
       degreeType: string;
       schoolCode: string;
       departmentCode: string;
+      intakes?: string[];
     };
 
     // ── Validation ──────────────────────────────────────────────────────
@@ -567,6 +591,12 @@ router.post("/", requireAuth,
 
     const normalizedName = normalizeProgramName(name.trim());
     const upperCode = code.trim().toUpperCase();
+
+    // Intakes: from the institution's definitions; default = its first-semester intake
+    const intakeDefs = await getIntakeDefinitions(req.user.institution);
+    const programIntakes = intakes === undefined
+      ? [(intakeDefs.find((d) => d.defaultSemester === 1) ?? intakeDefs[0]).code]
+      : cleanProgramIntakes(intakes, intakeDefs);
 
     // ── Check duplicate code (institution-wide) ─────────────────────────
     const existingByCode = await Program.findOne({
@@ -627,7 +657,7 @@ router.post("/", requireAuth,
       schoolCode,
       departmentCode,
       institution: req.user.institution,
-      intakes: ["SEPT"],
+      intakes: programIntakes,
       supportedEntryTypes: ["Direct"],
       isActive: true,
     });
@@ -780,6 +810,7 @@ router.put(
       schoolCode: string;
       departmentCode: string;
       isActive: boolean;
+      intakes: string[];
     }>;
 
     // ── Find existing ───────────────────────────────────────────────────
@@ -833,6 +864,27 @@ router.put(
           message: `Program code "${updateData.code.toUpperCase()}" is already in use.`,
         } as ApiError;
       }
+    }
+
+    // ── Intakes: validate, and keep any intake that enrolled students use ──
+    if (updateData.intakes !== undefined) {
+      const intakeDefs = await getIntakeDefinitions(req.user.institution);
+      const cleaned = cleanProgramIntakes(updateData.intakes, intakeDefs);
+      const removed = ((before as { intakes?: string[] }).intakes ?? []).filter((i) => !cleaned.includes(i));
+      for (const intake of removed) {
+        const n = await Student.countDocuments({
+          institution: req.user.institution,
+          program: before._id,
+          intake,
+        });
+        if (n > 0) {
+          throw {
+            statusCode: 400,
+            message: `Cannot remove the ${intake} intake: ${n} student(s) in this program were admitted under it.`,
+          } as ApiError;
+        }
+      }
+      updateData.intakes = cleaned;
     }
 
     // ── Update ──────────────────────────────────────────────────────────

@@ -35,6 +35,10 @@ export interface IMark extends Document {
   agreedMark: number; // The "AGREED MARKS /100" (The final score used for grading)
   attempt: string; // "1st", "re-take", "supplementary"
   examMode: "standard" | "mandatory_q1";
+  unitType?: "theory" | "lab" | "workshop";
+  /** Mark distribution this sheet was captured under (ca + exam = 100). Absent on legacy rows = 30/70. */
+  caMax?: number;
+  examMax?: number;
 
   // --- METADATA ---
   isSupplementary: boolean; // Derived from attempt field
@@ -74,8 +78,13 @@ const schema = new Schema<IMark>(
     examQ5Raw: { type: Number, min: 0, max: 20 },
 
     // FINAL AUDIT FIELDS (Filled with scoresheet data)
-    caTotal30: { type: Number, min: 0, max: 30, required: true },
-    examTotal70: { type: Number, min: 0, max: 70, required: true },
+    // Field names are historical: they hold the CA / exam parts under the unit's distribution (30/70 by default).
+    // The upper bounds (caMax / examMax) are enforced by the importers, not hard-coded here.
+    caTotal30: { type: Number, min: 0, max: 100, required: true },
+    examTotal70: { type: Number, min: 0, max: 100, required: true },
+    caMax: { type: Number, min: 0, max: 99 },
+    examMax: { type: Number, min: 1, max: 100 },
+    unitType: { type: String, enum: ["theory", "lab", "workshop"] },
     internalExaminerMark: { type: Number, min: 0, max: 100, required: false },
     agreedMark: { type: Number, min: 0, max: 100, required: true },
     attempt: { type: String, enum: ["1st", "re-take", "supplementary", "special"], default: "1st", },

@@ -7,7 +7,7 @@ export interface IProgramUnit extends Document {
   unit: mongoose.Types.ObjectId;     // Reference to Unit
   academicYear: string;         // Academic Year (e.g., "2023/2024")
   requiredYear: number;           // The year this unit is taken in the Program (e.g., 1st Year)
-  requiredSemester: 1 | 2;        // The semester this unit is taken in the Program (e.g., Semester 1)
+  requiredSemester: 1 | 2 | 3;    // The semester this unit is taken in the Program (3 = trimester / extended programs)
   isElective: boolean;            // Is this unit compulsory or optional for the Program?
 }
 
@@ -18,7 +18,7 @@ const schema = new Schema<IProgramUnit>(
     unit: { type: Schema.Types.ObjectId, ref: "Unit", required: true },
     academicYear: { type: String},
     requiredYear: { type: Number, required: true, min: 1, max: 6 },
-    requiredSemester: { type: Number, required: true, enum: [1, 2] },
+    requiredSemester: { type: Number, required: true, enum: [1, 2, 3] },
     isElective: { type: Boolean, default: false },
   },
   { timestamps: true }
