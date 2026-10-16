@@ -211,14 +211,26 @@ export async function applyCurriculumPlan(
     }
   }
 
-  const ops = plan.rows
+  const ops: mongoose.AnyBulkWriteOperation<any>[] = plan.rows
     .filter((r) => r.action !== "unchanged")
     .map((r) => ({
       updateOne: {
-        filter: { institution: institutionId, program: program._id, unit: unitByCode.get(r.code)!._id },
+        filter: {
+          institution: institutionId,
+          program: program._id,
+          unit: unitByCode.get(r.code)!._id,
+        },
         update: {
-          $set: { requiredYear: r.year, requiredSemester: r.semester, isElective: r.isElective },
-          $setOnInsert: { institution: institutionId, program: program._id, unit: unitByCode.get(r.code)!._id },
+          $set: {
+            requiredYear: r.year,
+            requiredSemester: r.semester,
+            isElective: r.isElective,
+          },
+          $setOnInsert: {
+            institution: institutionId,
+            program: program._id,
+            unit: unitByCode.get(r.code)!._id,
+          },
         },
         upsert: true,
       },
