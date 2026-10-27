@@ -77,30 +77,38 @@ export interface ISchool {
 }
 
 export interface IRuleSet {
-  supplementaryThreshold:   number;   // fraction of units — default 1/3
-  stayoutThreshold:         number;   // fraction — default 1/2
-  repeatYearMeanThreshold:  number;   // annual mean below this → repeat — default 40
-  passMark:                 number;   // default 40
-  maxCarryForwardUnits:     number;   // ENG.14 — default 2
-  carryForwardToFinalYear:  boolean;  // default false
+  supplementaryThreshold: number; // fraction of units — default 1/3
+  stayoutThreshold: number; // fraction — default 1/2
+  repeatYearMeanThreshold: number; // annual mean below this → repeat — default 40
+  passMark: number; // default 40
+  maxCarryForwardUnits: number; // ENG.14 — default 2
+  carryForwardToFinalYear: boolean; // default false
   // Duration = program.durationYears × this multiplier
   // BSc 5yr × 2 = 10yr max, BEd 4yr × 2 = 8yr max, Financial Eng 4yr × 2 = 8yr max
-  maxDurationMultiplier:    number;   // default 2.0
-  maxAttempts:              number;   // default 5
-  caWeight:                 number;   // default 30
-  examWeight:               number;   // default 70
-  catMax:                   number;   // default 20
-  assignmentMax:            number;   // default 10
-  practicalMax:             number;   // default 10
-  labMax:                   number;   // default 30
-  suppMarkCap:              number;   // ENG.13(f) — default = passMark (40)
-  hasLab:                   boolean;
-  hasPractical:             boolean;
-  hasWorkshop:              boolean;
-  useSemesterWeighting:     boolean;
-  minCourseworkAttendance:  number;   // ENG.23(b) — default 0.75
-  maxAbsentExams:           number;   // ENG.23(c) — default 6
-  gradeAppealWindowDays:    number;   // ENG.26 — default 28
+  maxDurationMultiplier: number; // default 2.0
+  maxAttempts: number; // default 5
+  caWeight: number; // default 30
+  examWeight: number; // default 70
+  catMax: number; // default 20
+  assignmentMax: number; // default 10
+  practicalMax: number; // default 10
+  labMax: number; // default 30
+  suppMarkCap: number; // ENG.13(f) — default = passMark (40)
+  hasLab: boolean;
+  hasPractical: boolean;
+  hasWorkshop: boolean;
+  useSemesterWeighting: boolean;
+  minCourseworkAttendance: number; // ENG.23(b) — default 0.75
+  maxAbsentExams: number; // ENG.23(c) — default 6
+  registrationDeadlineWeeks: number; // ENG.23(a)/(d) — default 4
+  enforcePracticalPass:     boolean;  // ENG.10(d) — practicals must be passed (default off)
+  /** ENG.22(c)/(e): discontinue a stay-out student who fails the retake ("retake"), or only after the supplementary that follows it ("supplementary", default). */
+  stayoutDiscontinuation:   "retake" | "supplementary";
+  /** ENG.10(e): a missed examination scores 0 and the unit is failed (default off: it is listed as missing). */
+  missedExamScoresZero:     boolean;
+  /** ENG.8(d)-(f), 24(b),(c): require attachments / teaching practicum to be passed before the award (default off). */
+  enforceAttachments:       boolean;
+  gradeAppealWindowDays: number; // ENG.26 — default 28
 }
 
 export interface IBrandingAssets {
@@ -217,30 +225,38 @@ const SchoolSchema = new Schema<ISchool>({
   departments: { type: [DepartmentSchema], default: [] },
 });
 
-const RuleSetSchema = new Schema<IRuleSet>({
-  supplementaryThreshold:  { type: Number, default: 1/3,  min: 0.1, max: 0.49 },
-  stayoutThreshold:        { type: Number, default: 0.5,  min: 0.1, max: 0.9 },
-  repeatYearMeanThreshold: { type: Number, default: 40,   min: 0,   max: 60 },
-  passMark:                { type: Number, default: 40,   min: 0,   max: 60 },
-  maxCarryForwardUnits:    { type: Number, default: 2,    min: 0,   max: 10 },
-  carryForwardToFinalYear: { type: Boolean, default: false },
-  maxDurationMultiplier:   { type: Number, default: 2.0,  min: 1,   max: 5 },
-  maxAttempts:             { type: Number, default: 5,    min: 1,   max: 20 },
-  caWeight:                { type: Number, default: 30,   min: 0,   max: 100 },
-  examWeight:              { type: Number, default: 70,   min: 0,   max: 100 },
-  catMax:                  { type: Number, default: 20,   min: 1 },
-  assignmentMax:           { type: Number, default: 10,   min: 1 },
-  practicalMax:            { type: Number, default: 10,   min: 0 },
-  labMax:                  { type: Number, default: 30,   min: 0 },
-  suppMarkCap:             { type: Number, default: 40,   min: 0,   max: 100 },
-  hasLab:                  { type: Boolean, default: true },
-  hasPractical:            { type: Boolean, default: true },
-  hasWorkshop:             { type: Boolean, default: false },
-  useSemesterWeighting:    { type: Boolean, default: true },
-  minCourseworkAttendance: { type: Number, default: 0.75, min: 0,   max: 1 },
-  maxAbsentExams:          { type: Number, default: 6,    min: 1 },
-  gradeAppealWindowDays:   { type: Number, default: 28,   min: 1 },
-}, { _id: false });
+const RuleSetSchema = new Schema<IRuleSet>(
+  {
+    supplementaryThreshold: { type: Number, default: 1 / 3, min: 0.1, max: 0.49 },
+    stayoutThreshold: { type: Number, default: 0.5, min: 0.1, max: 0.9 },
+    repeatYearMeanThreshold: { type: Number, default: 40, min: 0, max: 60 },
+    passMark: { type: Number, default: 40, min: 0, max: 60 },
+    maxCarryForwardUnits: { type: Number, default: 2, min: 0, max: 10 },
+    carryForwardToFinalYear: { type: Boolean, default: false },
+    maxDurationMultiplier: { type: Number, default: 2.0, min: 1, max: 5 },
+    maxAttempts: { type: Number, default: 5, min: 1, max: 20 },
+    caWeight: { type: Number, default: 30, min: 0, max: 100 },
+    examWeight: { type: Number, default: 70, min: 0, max: 100 },
+    catMax: { type: Number, default: 20, min: 1 },
+    assignmentMax: { type: Number, default: 10, min: 1 },
+    practicalMax: { type: Number, default: 10, min: 0 },
+    labMax: { type: Number, default: 30, min: 0 },
+    suppMarkCap: { type: Number, default: 40, min: 0, max: 100 },
+    hasLab: { type: Boolean, default: true },
+    hasPractical: { type: Boolean, default: true },
+    hasWorkshop: { type: Boolean, default: false },
+    useSemesterWeighting: { type: Boolean, default: true },
+    minCourseworkAttendance: { type: Number, default: 0.75, min: 0, max: 1 },
+    maxAbsentExams: { type: Number, default: 6, min: 1 },
+    registrationDeadlineWeeks: { type: Number, default: 4, min: 1, max: 20 },
+    enforcePracticalPass:    { type: Boolean, default: false },
+    stayoutDiscontinuation:  { type: String, enum: ["retake", "supplementary"], default: "supplementary" },
+    missedExamScoresZero:    { type: Boolean, default: false },
+    enforceAttachments:      { type: Boolean, default: false },
+    gradeAppealWindowDays: { type: Number, default: 28, min: 1 },
+  },
+  { _id: false },
+);
 
 const SemesterWeightSchema = new Schema<ISemesterWeightMap>({
   year:   { type: Number, required: true },

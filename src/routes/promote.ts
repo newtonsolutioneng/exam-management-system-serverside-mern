@@ -1,10 +1,12 @@
 // serverside/src/routes/promote.ts
+import { lapTimer } from "../utils/perfLog";
 import { Router, Response } from "express";
 import { requireAuth, requireRole } from "../middleware/auth";
 import { asyncHandler } from "../middleware/asyncHandler";
 import type { AuthenticatedRequest } from "../middleware/auth";
 import { bulkPromoteClass, calculateStudentStatus, previewPromotion, promoteStudent } from "../services/statusEngine";
 import Program from "../models/Program";
+import PromotionReportLog from "../models/PromotionReportLog";
 import {
   generatePromotionWordDoc, generateEligibleSummaryDoc, generateIneligibilityNotice, PromotionData,
   generateSpecialExamNotice, generateStudentTranscript, generateSupplementaryExamsDoc, generateSpecialExamsDoc,
@@ -34,6 +36,17 @@ import { loadInstitutionSettings } from "../utils/loadInstitutionSettings";
 
 const router = Router();
 
+/** Remember that the CMS or the reports were generated for this class (used to warn before promoting). */
+async function logReportsGenerated(req: AuthenticatedRequest, programId: string, yearOfStudy: number, academicYear: string, kind: "cms" | "reports") {
+  try {
+    await PromotionReportLog.findOneAndUpdate(
+      { program: programId, yearOfStudy: Number(yearOfStudy), academicYear, kind },
+      { $set: { institution: req.user.institution, at: new Date(), by: req.user._id } },
+      { upsert: true },
+    );
+  } catch (e) { console.warn("[promote] could not record report generation:", (e as Error).message); }
+}
+
 // preview-promotion
 router.post("/preview-promotion", requireAuth, requireRole("coordinator"), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
     const { programId, yearToPromote, academicYearName } = req.body;
@@ -47,6 +60,22 @@ router.post("/preview-promotion", requireAuth, requireRole("coordinator"), async
 router.post( "/bulk-promote", requireAuth, requireRole("coordinator"), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
     const { programId, yearToPromote, academicYearName } = req.body;
     if (!programId || !yearToPromote || !academicYearName) return res.status(400).json({ error: "Missing required promotion parameters" }); 
+
+    // Promoting moves students on, which changes what the CMS and reports for this year show. Make sure the
+    // coordinator has generated both first, unless they knowingly skip the check.
+    if (!req.body.skipReportCheck) {
+      const done = await PromotionReportLog.find({ program: programId, yearOfStudy: Number(yearToPromote), academicYear: academicYearName }).lean();
+      const missing = [
+        ...(done.some((d: any) => d.kind === "cms") ? [] : ["the Consolidated Mark Sheet (CMS)"]),
+        ...(done.some((d: any) => d.kind === "reports") ? [] : ["the summary reports"]),
+      ];
+      if (missing.length) {
+        return res.status(409).json({
+          success: false, code: "REPORTS_NOT_DOWNLOADED", missing,
+          message: `You have not generated ${missing.join(" and ")} for this class yet.`,
+        });
+      }
+    }
 
     const results = await bulkPromoteClass( programId, yearToPromote, academicYearName );
     res.json({ success: true, message: `Process completed: ${results.promoted} promoted, ${results.failed} failed.`, data: results });
@@ -110,6 +139,7 @@ router.post( "/download-report-progress", requireAuth, asyncHandler(async (req: 
         programName: program?.name || "Program",
         academicYear: academicYearName,
         yearOfStudy: yearToPromote,
+        totalYears: (program as any)?.durationYears,
         eligible: preview.eligible,
         blocked: preview.blocked,
         offeredUnits,
@@ -295,6 +325,7 @@ await addDocIfNotEmpty(suppLeave, getFileName("Supplementary_After_Academic_Leav
       const zipBase64 = zip.toBuffer().toString("base64");
       res.write(`data: ${JSON.stringify({ percent: 100, message: "Complete!", file: zipBase64 })}\n\n`);
       res.end();
+      await logReportsGenerated(req, programId, yearToPromote, academicYearName, "reports");
 
     } catch (err) {
       console.error("Report Generation Error:", err);
@@ -330,12 +361,14 @@ router.post(
 
     try {
       sendProgress(10, "Fetching student data...");
+      const lap = lapTimer("download-cms");
 
       const preview = await previewPromotion(
         programId,
         yearToPromote,
         academicYearName,
       );
+      lap("promotion analysis");
       const program = await Program.findById(programId).lean();
 
       // ── Academic year document (for session type AND mark filtering) ──────
@@ -417,14 +450,18 @@ router.post(
 
       sendProgress(50, "Loading mark records...");
 
+      // Only this year's units matter below, so don't load (and populate) every mark of every year.
+      const yearPuIds = (await ProgramUnit.find({ program: programId, requiredYear: yearToPromote }).select("_id").lean())
+        .map((pu: any) => pu._id);
+      lap("student lists");
       const [detailedMarks, directMarks] = await Promise.all([
-        Mark.find({ student: { $in: studentIds } })
+        Mark.find({ student: { $in: studentIds }, programUnit: { $in: yearPuIds } })
           .populate({
             path: "programUnit",
             populate: { path: "unit", select: "code name" },
           })
           .lean(),
-        MarkDirect.find({ student: { $in: studentIds } })
+          MarkDirect.find({ student: { $in: studentIds }, programUnit: { $in: yearPuIds } })
           .populate({
             path: "programUnit",
             populate: { path: "unit", select: "code name" },
@@ -478,7 +515,9 @@ router.post(
         gradingScale,
       };
 
+      lap("marks + settings");
       const xlsxBuffer = await generateConsolidatedMarkSheet(excelData);
+      lap("generate workbook"); lap.done();
 
       sendProgress(95, "Preparing download...");
 
@@ -487,6 +526,7 @@ router.post(
         `data: ${JSON.stringify({ percent: 100, message: "Complete!", file: base64 })}\n\n`,
       );
       res.end();
+      await logReportsGenerated(req, programId, yearToPromote, academicYearName, "cms");
       // } catch (err: any) {
       //   console.error("CMS Generation Error:", err);
       //   res.write(`data: ${JSON.stringify({ error: "Failed to generate CMS" })}\n\n`);

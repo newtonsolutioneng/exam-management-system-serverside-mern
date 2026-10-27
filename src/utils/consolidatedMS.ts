@@ -1,10 +1,11 @@
 // serverside/src/utils/consolidatedMS.ts
 
+import { lapTimer } from "./perfLog";
 import * as ExcelJS     from "exceljs";
 import config           from "../config/config";
 import { loadInstitutionSettings } from "./loadInstitutionSettings";
 import { resolveStudentStatus }    from "./studentStatusResolver";
-import { calculateStudentStatus }  from "../services/statusEngine";
+import { calculateStudentStatus, auditClass } from "../services/statusEngine";
 import { buildDisplayRegNo }       from "./academicRules";
 import mongoose                    from "mongoose";
 import { buildRichRegNoCMS }       from "./scoresheetStudentList";
@@ -323,8 +324,8 @@ export const generateConsolidatedMarkSheet = async (
   // setCenteredHeader(5, `${config.schoolName || "SCHOOL OF ENGINEERING"}`);
   // setCenteredHeader(6, `${programName}`);
   setCenteredHeader(4, meta.universityName);
-setCenteredHeader(5, meta.schoolName);
-setCenteredHeader(6, programName);
+  setCenteredHeader(5, meta.schoolName);
+  setCenteredHeader(6, programName);
   setCenteredHeader(
     7,
     `CONSOLIDATED MARK SHEET - - ${examPhaseLabel} - ${yrTxt} YEAR - ${academicYear} ACADEMIC YEAR`,
@@ -416,6 +417,11 @@ setCenteredHeader(6, programName);
     passMark,
   );
 
+  // Run the status engine for the whole class up-front (batched), not one student at a time.
+  const lap = lapTimer("consolidated mark sheet");
+  const classAudit = await auditClass(allStudentIds, programId, academicYear, yearOfStudy);
+  lap("status engine (whole class)");
+
   // ── 4. Student data rows ──────────────────────────────────────────────────
   let currentIndex = 0;
 
@@ -449,9 +455,11 @@ setCenteredHeader(6, programName);
       audit = makeAdminAudit(adminStatusLabel, offeredUnits.length, isDisciplinary);
     } else {
       try {
-        audit = await calculateStudentStatus(
+        const pre = classAudit.get(sId);
+        if (pre?.error) throw new Error(pre.error);
+        audit = (pre?.audit ?? await calculateStudentStatus(
           sId, programId, academicYear, yearOfStudy, { forPromotion: true },
-        ) as Record<string, any>;
+        )) as Record<string, any>;
       } catch (err: any) {
         console.error(`[CMS] Engine failed for ${(student as any).regNo}:`, err.message);
         audit = {
@@ -838,6 +846,9 @@ setCenteredHeader(6, programName);
     fitToPage: true, fitToWidth: 1, fitToHeight: 0,
   };
 
+  lap("build sheet");
   const result = await workbook.xlsx.writeBuffer();
+  lap("write file");
+  lap.done();
   return Buffer.from(result as ArrayBuffer);
 };

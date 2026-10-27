@@ -11,7 +11,7 @@ interface StudentWithProgram {
   programType?: string;
   totalTimeOutYears?: number;
   institution?: unknown;
-  admissionAcademicYear?: { year?: string };
+  admissionAcademicYear?: { year?: string; startDate?: Date };
   program?: {
     _id: unknown;
     institution: unknown;
@@ -30,9 +30,9 @@ export const startComplianceCronJobs = (): void => {
     const activeStudents = await Student.find({
       status: { $in: ["active", "repeat", "on_leave", "deferred"] },
     })
-      .populate<{ admissionAcademicYear: { year: string } }>(
+    .populate<{ admissionAcademicYear: { year: string; startDate?: Date } }>(
         "admissionAcademicYear",
-        "year",
+        "year startDate",
       )
       .populate<{
         program: { _id: unknown; institution: unknown; durationYears: number };
@@ -62,8 +62,12 @@ export const startComplianceCronJobs = (): void => {
       const maxYears = Math.round(programDuration * multiplier);
 
       // Subtract approved leave years
-      const effectiveYears =
-        nowYear - admissionYear - (student.totalTimeOutYears ?? 0);
+      // Measured from the first day of the admission year when known (not by calendar-year subtraction).
+      const admissionStart = (student.admissionAcademicYear as any)?.startDate;
+      const elapsedYears = admissionStart
+        ? (now.getTime() - new Date(admissionStart).getTime()) / (365.25 * 24 * 3600 * 1000)
+        : nowYear - admissionYear;
+      const effectiveYears = Math.round((elapsedYears - (student.totalTimeOutYears ?? 0)) * 100) / 100;
 
       if (effectiveYears > maxYears) {
         const rule = `ENG.19(${programDuration > 4 ? "d" : "e"})`;

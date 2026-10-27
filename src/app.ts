@@ -4,6 +4,8 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import compression from "compression";
 import helmet from "helmet";
+import { requestTiming, startEventLoopMonitor } from "./utils/perfLog";
+import { LOGO_FILE } from "./config/emailLogo";
 import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
 import config from "./config/config";
@@ -29,10 +31,19 @@ import promoteRoutes from "./routes/promote";
 import maintenanceRoutes from "./routes/maintenance";
 import billingRoutes from "./routes/billing";
 import disciplinaryRoutes from "./routes/disciplinary";
+import complianceRoutes from "./routes/compliance";
 
 dotenv.config();
 
 const app = express();
+app.use(requestTiming);
+startEventLoopMonitor();
+
+// Public, cache-friendly logo for e-mails (no login, no cookies).
+app.get("/brand/logo.png", (_req, res) => {
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  res.sendFile(LOGO_FILE, (err) => { if (err && !res.headersSent) res.status(404).end(); });
+});
 
 // ── MUST be the very first app configuration ──────────────────────────────────
 // Tells Express to trust the X-Forwarded-Proto header from Nginx.
@@ -182,6 +193,7 @@ apiRouter.use("/program-units", programUnitsRouter);
 apiRouter.use("/promote", promoteRoutes);
 apiRouter.use("/maintenance", maintenanceRoutes);
 apiRouter.use("/billing", billingRoutes);
+apiRouter.use("/compliance", complianceRoutes);
 apiRouter.use("/disciplinary", disciplinaryRoutes);
 
 app.use("/api", apiRouter);

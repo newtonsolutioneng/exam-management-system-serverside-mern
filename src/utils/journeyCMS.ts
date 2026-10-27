@@ -966,6 +966,7 @@ import { getYearWeight }      from "../utils/weightingRegistry";
 import { buildDisplayRegNo }  from "../utils/academicRules";
 import { loadInstitutionSettings } from "./loadInstitutionSettings";
 import { loadLogoBuffer } from "./loadLogoBuffer";
+import AuditedUnit from "../models/AuditedUnit";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -1978,6 +1979,7 @@ function buildLegend(wb: ExcelJS.Workbook, logoBuffer: Buffer) {
     // CHANGE 2: Disciplinary row entry in legend
     ["SUSP.",  "Disciplinary suspension — pending reinstatement", F.disciplinary],
     // CHANGE 3: Attempt number entry in legend
+    ["AUDITED", "Audited unit (ENG.9) — listed on the AUDITED UNITS sheet, never counted in the WAA", F.none],
     ["45²",    "Mark with superscript = attempt number (² = 2nd attempt, ENG.22 risk: underlined at attempt ≥4)", F.supp],
   ];
 
@@ -2055,6 +2057,50 @@ function buildLegend(wb: ExcelJS.Workbook, logoBuffer: Buffer) {
 // };
 
 // In generateJourneyCMS — fix the settings/logo loading (inside the function, not top-level):
+// ── ENG.9: audited units sheet ────────────────────────────────────────────────
+// Audited units are listed for the transcript but sit outside the curriculum, so they never feed
+// a mean, the WAA or the classification on the other sheets.
+export async function buildAuditedSheet(
+  wb: ExcelJS.Workbook, records: StudentJourneyRecord[], programId: string, logoBuffer: Buffer,
+): Promise<void> {
+  const students: any[] = await Student.find({ program: programId }).select("_id regNo").lean();
+  if (students.length === 0) return;
+  const rows: any[] = await AuditedUnit.find({ student: { $in: students.map((s) => s._id) } })
+    .populate("unit", "code name").populate("academicYear", "year").lean();
+  if (rows.length === 0) return;
+
+  const byId = new Map(students.map((s) => [String(s._id), s.regNo as string]));
+  const recOf = new Map(records.map((r) => [r.regNo, r]));
+  const lines = rows.map((r) => {
+    const baseReg = byId.get(String(r.student)) || "";
+    const rec = recOf.get(baseReg);
+    return {
+      regNo: rec?.displayRegNo || baseReg, name: rec?.name || "", year: r.yearOfStudy as number,
+      acYear: r.academicYear?.year || "", code: r.unit?.code || "", unitName: r.unit?.name || "",
+      mark: r.mark ?? "", grade: r.grade ?? "",
+    };
+  }).sort((a, b) => a.regNo.localeCompare(b.regNo) || a.year - b.year || a.code.localeCompare(b.code));
+
+  const sheet = wb.addWorksheet("AUDITED UNITS");
+  addLogo(wb, sheet, logoBuffer, 9);
+  [18, 30, 9, 13, 12, 34, 8, 8, 40].forEach((w, i) => (sheet.getColumn(i + 1).width = w));
+  hdrRow(sheet, 4, "AUDITED UNITS (ENG.9)", 9, 11, true, true);
+  hdrRow(sheet, 5, "Shown on the transcript. Not counted towards the classification.", 9, 9, false, false);
+
+  const head = sheet.getRow(7);
+  head.values = ["REG NO", "NAME", "YEAR", "ACADEMIC YEAR", "UNIT", "UNIT NAME", "MARK", "GRADE", "NOTE"];
+  head.eachCell((c) => { c.font = { bold: true, name: FONT, size: 9 }; c.border = THIN; c.fill = F.hdr; c.alignment = { horizontal: "center", vertical: "middle", wrapText: true }; });
+
+  lines.forEach((l, i) => {
+    const r = sheet.getRow(8 + i);
+    r.values = [l.regNo, l.name, l.year, l.acYear, l.code, l.unitName, l.mark, l.grade, "Audited — not counted in classification"];
+    r.eachCell({ includeEmpty: true }, (c, col) => {
+      c.border = THIN; c.font = { name: FONT, size: 9 };
+      c.alignment = { horizontal: [1, 2, 6, 9].includes(col) ? "left" : "center", vertical: "middle" };
+    });
+  });
+}
+
 export const generateJourneyCMS = async (data: JourneyCMSData): Promise<Buffer> => {
   const { programId, programName, academicYear, institutionId } = data;
 
@@ -2087,6 +2133,7 @@ export const generateJourneyCMS = async (data: JourneyCMSData): Promise<Buffer> 
     }
   }
 
+  await buildAuditedSheet(wb, records, programId, logoBuffer);
   buildLegend(wb, logoBuffer);
 
   const buf = await wb.xlsx.writeBuffer();

@@ -119,9 +119,17 @@ router.post( "/trash-action", requireAuth,
       },
     );
 
-    const detailedIds = normalised.filter((e) => e.source === "detailed").map((e) => e.id);
-    const directIds   = normalised.filter((e) => e.source === "direct")  .map((e) => e.id);
-
+    // ENG.17: nullified results are not in the Bin's gift — lift the nullification instead.
+    const [nullD, nullM] = await Promise.all([
+      Mark.find({ _id: { $in: normalised.filter((e) => e.source === "detailed").map((e) => e.id) }, deletedAt: { $ne: null }, nullificationId: { $ne: null } }).select("_id").lean(),
+      MarkDirect.find({ _id: { $in: normalised.filter((e) => e.source === "direct").map((e) => e.id) }, deletedAt: { $ne: null }, nullificationId: { $ne: null } }).select("_id").lean(),
+    ]);
+    const blocked = new Set([...nullD, ...nullM].map((m: any) => String(m._id)));
+    const detailedIds = normalised.filter((e) => e.source === "detailed" && !blocked.has(String(e.id))).map((e) => e.id);
+    const directIds   = normalised.filter((e) => e.source === "direct"   && !blocked.has(String(e.id))).map((e) => e.id);
+    if (blocked.size > 0 && detailedIds.length + directIds.length === 0)
+      return res.status(409).json({ error: "These results were nullified under ENG.17. Lift the nullification from the Compliance screen." });
+    
     // ── RESTORE ─────────────────────────────────────────────────────────────
     if (action === "restore") {
       // Restore detailed marks

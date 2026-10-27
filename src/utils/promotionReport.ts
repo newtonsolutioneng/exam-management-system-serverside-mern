@@ -11,23 +11,39 @@ import { displayRegNo } from "./regNoQualifier";
 
 export interface PromotionData {
   programName: string;  academicYear: string;  yearOfStudy: number;  
+  /** Length of the programme in years; the last year has no "next year" to proceed to. */
+  totalYears?: number;
   eligible: any[];  blocked: any[];  logoBuffer: Buffer; offeredUnits?: { code: string; name: string }[];
   examType?: "ORDINARY" | "SUPPLEMENTARY"; institutionId: string;
 }
 
-const numberToWords = (num: number): string => {
+export const numberToWords = (num: number): string => {
   const ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
   const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
-  
+  if (!Number.isFinite(num) || num < 0) return String(num);
+  num = Math.floor(num);
   if (num === 0) return "Zero";
-  if (num < 20) return ones[num];
-  const digit = num % 10;
-  return tens[Math.floor(num / 10)] + (digit ? "-" + ones[digit] : "");
+  const below100 = (n: number): string => {
+    if (n < 20) return ones[n];
+    const digit = n % 10;
+    return tens[Math.floor(n / 10)] + (digit ? "-" + ones[digit] : "");
+  };
+  const below1000 = (n: number): string => {
+    if (n < 100) return below100(n);
+    const rest = n % 100;
+    return ones[Math.floor(n / 100)] + " Hundred" + (rest ? " and " + below100(rest) : "");
+  };
+  if (num < 1000) return below1000(num);
+  if (num < 1000000) {
+    const rest = num % 1000;
+    return below1000(Math.floor(num / 1000)) + " Thousand" + (rest ? (rest < 100 ? " and " : " ") + below1000(rest) : "");
+  }
+  return String(num);
 };
 
 // Helper to convert Year 1 to "First Year", etc.
 const getOrdinalYear = (year: number): string => {
-  const ordinals = ["", "First", "Second", "Third", "Fourth", "Fifth", "Sixth"];
+  const ordinals = ["", "First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh"];
   return ordinals[year] || `${year}th`;
 };
 
@@ -233,6 +249,7 @@ function createOfferedUnitsTable(units: { code: string; name: string }[]) {
 
 export const generateEligibleSummaryDoc = async ( data: any ): Promise<Buffer> => {
   const { programName, academicYear, yearOfStudy, eligible } = data;
+  const isFinalYear = !!data.totalYears && yearOfStudy >= data.totalYears;
   const { meta, logoBuffer } = await getDocContext(data); 
   const candidateCountWords = numberToWords(eligible.length);
   const currentYearOrdinal = getOrdinalYear(yearOfStudy);
@@ -258,9 +275,13 @@ export const generateEligibleSummaryDoc = async ( data: any ): Promise<Buffer> =
               new TextRun({ text: `${currentYearOrdinal} Year `, bold: true, size: 22  }),
               new TextRun({ text: `Examinations for the `, size: 22 }),
               new TextRun({ text: `${programName}. `, bold: true, size: 22  }),
-              new TextRun({ text: `The ${meta.schoolName} Board of Examiners recommends that they proceed to their `, size: 22 }),         
-              new TextRun({ text: `${nextYearOrdinal} Year `, bold: true, size: 22 }),
-              new TextRun({ text: `of study.`, size: 22 }),
+              ...(isFinalYear
+                ? [new TextRun({ text: `The ${meta.schoolName} Board of Examiners recommends that they be considered for the award of the degree.`, size: 22 })]
+                    : [
+                new TextRun({ text: `The ${meta.schoolName} Board of Examiners recommends that they proceed to their `, size: 22 }),
+                       new TextRun({ text: `${nextYearOrdinal} Year `, bold: true, size: 22 }),
+                       new TextRun({ text: `of study.`, size: 22 }),
+              ]),  
             ],
           }),
 
@@ -1500,6 +1521,7 @@ interface IneligibilityNoticeData {
   academicYear: string;
   yearOfStudy: number;
   logoBuffer: Buffer;
+  totalYears?: number;
 }
 
 export const generateIneligibilityNotice = async (
@@ -1585,7 +1607,7 @@ export const generateIneligibilityNotice = async (
             spacing: { before: 400, after: 400 },
             children: [
               new TextRun({
-                text: `RE: INELIGIBILITY FOR PROMOTION TO YEAR ${yearOfStudy + 1}`,
+                text: data.totalYears && yearOfStudy >= data.totalYears ? `RE: INELIGIBILITY FOR GRADUATION` : `RE: INELIGIBILITY FOR PROMOTION TO YEAR ${yearOfStudy + 1}`,
                 bold: true,
                 size: 22,
                 underline: {},

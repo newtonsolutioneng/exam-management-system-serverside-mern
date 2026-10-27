@@ -33,11 +33,20 @@ export const assessAndGrantCarryForward = async (
   const settings = await InstitutionSettings.findOne({ institution: (student as any).institution }).lean();
   const passMark = (settings as any)?.passMark ?? 40;
 
-  // ENG.14a: No carry-forward to final year
+  // ENG.14(a): B.Sc may carry forward into years 2, 3 and 4 (never into the final year).
+  // ENG.14(b): B.Ed (Technology) may carry forward into years 2 and 3 only,
+  //            i.e. never into year 4 even though that is not the last year of a 5-year programme.
   const programDoc = await mongoose.model("Program").findById(programId).lean() as any;
   const finalYear  = programDoc?.durationYears || 5;
-  if (yearOfStudy >= finalYear) {
-    return { granted: false, cfUnits: [], qualifier: "", reason: `ENG.14: No carry-forward to final year (Year ${finalYear}).` };
+  const isBEd      = programDoc?.degreeType === "BEd";
+  const lastCfFromYear = isBEd ? Math.min(2, finalYear - 1) : finalYear - 1;
+  if (yearOfStudy > lastCfFromYear) {
+    return {
+      granted: false, cfUnits: [], qualifier: "",
+      reason: isBEd
+        ? `ENG.14(b): B.Ed carry-forward is allowed into years 2 and 3 only (not into Year ${yearOfStudy + 1}).`
+        : `ENG.14(a): No carry-forward into the final year (Year ${finalYear}).`,
+    };
   }
 
   const programUnits = await ProgramUnit.find({ program: programId, requiredYear: yearOfStudy })
@@ -67,7 +76,7 @@ export const assessAndGrantCarryForward = async (
     const mark  = (m as any).agreedMark ?? 0;
     const hasCA = ((m as any).caTotal30 ?? 0) > 0;
 
-    if (mark < passMark) {
+    if (mark < passMark || ((settings as any)?.ruleSet?.enforcePracticalPass === true && (m as any).practicalFailed === true)) {
       const code = (pu as any).unit?.code || "N/A";
       failedUnitCodes.push(code);
       if (!hasCA) noCAUnitCodes.push(code); // ENG.15a: missing CA → cannot CF

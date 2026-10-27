@@ -2,7 +2,7 @@
 // serverside/src/config/passwordResetEmail.ts
 import nodemailer from "nodemailer";
 import config from "./config";
-import path from "path";
+import { getEmailLogo } from "./emailLogo";
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
@@ -13,7 +13,6 @@ const transporter = nodemailer.createTransport({
 });
 
 // Path to your logo
-const logoPath = path.join(process.cwd(), "public", "acadedesk.png");
 
 export const sendRecoveryEmail = async (
   to: string,
@@ -26,12 +25,8 @@ export const sendRecoveryEmail = async (
     from: `"${config.appName} Security" <${config.emailUser}>`,
     to,
     subject: `Password Recovery — ${config.appName}`,
-    // Attach the logo for the header
-    attachments: [{
-      filename: 'acadedesk.png',
-      path: logoPath,
-      cid: 'applogo'
-    }],
+    // The logo is referenced by URL; it is attached inline only in local development.
+    attachments: getEmailLogo().attachments,
     html: `
 <!DOCTYPE html>
 <html lang="en">
@@ -60,7 +55,7 @@ export const sendRecoveryEmail = async (
                     ${config.appName}
                   </td>
                   <td align="right">
-                    <img src="cid:applogo" alt="Logo" width="36" height="36" 
+                  <img src="${getEmailLogo().src}" alt="Logo" width="36" height="36" 
                          style="display:block;border-radius:6px;object-fit:contain;" />
                   </td>
                 </tr>

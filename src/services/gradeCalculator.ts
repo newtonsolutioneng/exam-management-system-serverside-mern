@@ -7,6 +7,7 @@ import Student from "../models/Student";
 import InstitutionSettings from "../models/InstitutionSettings";
 import { calculateFinalResult } from "../utils/gradingCore";
 import mongoose from "mongoose";
+import { recordAttempt } from "./attemptRegistry";
 import type { AuthenticatedRequest } from "../middleware/auth";
 
 interface ComputeOptions {
@@ -72,8 +73,14 @@ export async function computeFinalGrade({ markId, session }: ComputeOptions) {
   });
 
   // ── 3. Preservation strategy ──────────────────────────────────────────────
-  const finalCA    = result.caTotal   === 0 && markDoc.caTotal30   > 0 ? markDoc.caTotal30   : result.caTotal;
-  const finalExam  = result.examTotal === 0 && markDoc.examTotal70 > 0 ? markDoc.examTotal70 : result.examTotal;
+  // ENG.13(f): a supplementary mark excludes CA and is capped at the pass mark (40%).
+  const isSuppAttempt = markDoc.attempt === "supplementary";
+  // ENG.13(e): a wholly-coursework unit is supplemented by extra coursework (capped at the pass mark).
+  const caOnlyUnit = markDoc.examMax === 0;
+  const preservedCA = result.caTotal === 0 && markDoc.caTotal30 > 0 ? markDoc.caTotal30 : result.caTotal;
+  const finalCA    = isSuppAttempt ? (caOnlyUnit ? Math.min(passMark, preservedCA) : 0) : preservedCA;
+  const rawFinalExam = result.examTotal === 0 && markDoc.examTotal70 > 0 ? markDoc.examTotal70 : result.examTotal;
+  const finalExam  = isSuppAttempt ? Math.min(passMark, rawFinalExam) : rawFinalExam;
   const finalAgreed = finalCA + finalExam;
 
   // ── 4. Special exam override (ENG.18) ─────────────────────────────────────
@@ -112,9 +119,25 @@ export async function computeFinalGrade({ markId, session }: ComputeOptions) {
                 : "1ST_ATTEMPT";
   }
 
+  // ── 4b. Practical pass (ENG.10(d)) ────────────────────────────────────────
+  // Optional (settings.ruleSet.enforcePracticalPass). Applies to lab/workshop units on
+  // detailed sheets where a practical mark was actually recorded; a supplementary sitting
+  // does not re-assess the practical, so the earlier verdict is kept.
+  let practicalFailed = markDoc.practicalFailed === true;
+  if (ruleSet.enforcePracticalPass === true && !isDirect && !isSuppAttempt
+      && (unitType === "lab" || unitType === "workshop")
+      && markDoc.practicalRaw !== undefined && markDoc.practicalRaw !== null && practicalMax > 0) {
+    practicalFailed = (markDoc.practicalRaw / practicalMax) * 100 < passMark;
+  }
+  if (ruleSet.enforcePracticalPass === true && practicalFailed && status === "PASS") {
+    status = "SUPPLEMENTARY";
+    grade  = "E";
+  }
+
   // ── 5. Update source mark ─────────────────────────────────────────────────
   const markUpdate = {
     $set: {
+      ...(isDirect ? {} : { practicalFailed }),
       caTotal30:   finalCA,
       examTotal70: (isSpecial && finalExam === 0) ? 0 : finalExam,
       agreedMark:  (isSpecial && finalExam === 0) ? finalCA : finalAgreed,
@@ -122,6 +145,33 @@ export async function computeFinalGrade({ markId, session }: ComputeOptions) {
   };
   if (isDirect) await MarkDirect.updateOne({ _id: markId }, markUpdate).session(session || null);
   else          await Mark.updateOne({ _id: markId }, markUpdate).session(session || null);
+
+  // ── 5b. Attempt tracking (ENG.16(b), ENG.22(b)) ───────────────────────────
+  // A pending special (exam not yet sat) is not an attempt.
+  let attemptNumber = 1;
+  if (!(isSpecial && finalExam === 0)) {
+    try {
+      const unitRef: any = markDoc.programUnit;
+      let unitId: any = unitRef?.unit;
+      if (!unitId && unitRef?._id) {
+        const pu: any = await mongoose.model("ProgramUnit").findById(unitRef._id).select("unit").lean();
+        unitId = pu?.unit;
+      }
+      const ay: any = markDoc.academicYear;
+      const rec = await recordAttempt({
+        studentId:    markDoc.student._id || markDoc.student,
+        unitId:       unitId || (unitRef?._id ?? unitRef),
+        academicYear: String(ay?.year ?? ay?._id ?? ay),
+        type:         attemptType === "SPECIAL" ? "1ST_ATTEMPT" : attemptType,
+        mark:         finalAgreed,
+        passed:       status === "PASS",
+        session,
+      });
+      attemptNumber = rec.attemptNumber;
+    } catch (err) {
+      console.error("[gradeCalculator] attempt registry:", (err as Error).message);
+    }
+  }
 
   // ── 6. Upsert FinalGrade ──────────────────────────────────────────────────
   await FinalGrade.findOneAndUpdate(
@@ -139,6 +189,7 @@ export async function computeFinalGrade({ markId, session }: ComputeOptions) {
         status,
         isSpecial:    isSpecial && finalExam === 0,
         attemptType,
+        attemptNumber,
         institution:  markDoc.institution,
         semester:     markDoc.semester || "SEMESTER 1",
       },

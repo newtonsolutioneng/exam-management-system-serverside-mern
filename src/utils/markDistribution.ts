@@ -31,8 +31,10 @@ export function parseDistribution(raw: unknown): { distribution: MarkDistributio
   if (![c, e].every((n) => Number.isFinite(n) && Number.isInteger(n))) {
     return { error: "Mark distribution must be whole numbers, e.g. CA 30 / Exam 70." };
   }
-  if (c < 0 || e < 1 || c + e !== 100) {
-    return { error: `Mark distribution must add up to 100 (got CA ${c} + Exam ${e}).` };
+  if (c < 0 || e < 0 || c + e !== 100) {
+    return {
+      error: `Mark distribution must add up to 100 (got CA ${c} + Exam ${e}).`,
+    };
   }
   return { distribution: { ca: c, exam: e } };
 }

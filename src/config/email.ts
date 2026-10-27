@@ -2,6 +2,7 @@
 import nodemailer from "nodemailer";
 import config from "./config";
 import path from "path";
+import { getEmailLogo } from "./emailLogo";
 
 // ─── Email transporter ─────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -22,12 +23,11 @@ export interface InviteEmailContext {
 }
 
 // Path to your logo - using process.cwd() to reach the root public folder
-const logoPath = path.join(process.cwd(), "public", "acadedesk.png");
 
 // ─── Helper — logo HTML ──────────────────────────────────────────────────────
 function logoImg(width: number = 44, height: number = 44): string {
-  // We reference 'cid:applogo' which matches the attachment ID below
-  return `<img src="cid:applogo" alt="${config.appName}" width="${width}" height="${height}" 
+  // Public URL when configured (no attachment); inline cid only as the local-development fallback.
+  return `<img src="${getEmailLogo().src}" alt="${config.appName}" width="${width}" height="${height}" 
                style="display:block;border-radius:6px;object-fit:contain;" />`;
 }
 
@@ -195,12 +195,8 @@ export const sendInviteEmail = async (ctx: InviteEmailContext): Promise<void> =>
     to: ctx.to,
     subject: `Invitation — to join ${ctx.universityName} on ${config.appName}`,
     html,
-    // Add the attachment here to power the "cid:applogo" src
-    attachments: [{
-      filename: 'logo.png',
-      path: logoPath,
-      cid: 'applogo' 
-    }]
+    // Empty when the logo is referenced by URL — nothing is attached to the message.
+    attachments: getEmailLogo().attachments
   });
 };
 

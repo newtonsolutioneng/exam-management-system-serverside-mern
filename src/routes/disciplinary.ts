@@ -530,6 +530,7 @@
 
 
 // serverside/src/routes/disciplinary.ts - WITH SCOPING
+import { REG_QUALIFIERS } from "../utils/academicRules";
 import { Router, Response } from "express";
 import { asyncHandler } from "../middleware/asyncHandler";
 import {
@@ -803,8 +804,14 @@ router.patch(
     let newStudentStatus = student.status as string;
 
     if (outcome === "SENT_HOME") {
-      student.qualifierSuffix = `RP${Math.min((student.qualifierSuffix?.match(/\d/) ? parseInt(student.qualifierSuffix) : 0) + 1, 5)}D`;
-      newStudentStatus = "disciplinary_suspension";
+      // Next repeat number = highest RP{n}[D] already on record + 1 (parseInt("RP1") is NaN, so use a regex).
+      const priorRp = /^RP(\d)/.exec(student.qualifierSuffix || "");
+      const priorRepeats = ((student as any).academicHistory || []).filter((h: any) => h.isRepeatYear).length;
+      const nextRp = Math.max(priorRp ? parseInt(priorRp[1], 10) : 0, priorRepeats) + 1;
+      student.qualifierSuffix = REG_QUALIFIERS.disciplinaryRepeat(nextRp);
+       newStudentStatus = "disciplinary_suspension";
+     } else if (outcome === "DISCONTINUED") {
+       newStudentStatus = "discontinued";
     } else if (outcome === "DISCONTINUED") {
       newStudentStatus = "discontinued";
       student.qualifierSuffix = "";

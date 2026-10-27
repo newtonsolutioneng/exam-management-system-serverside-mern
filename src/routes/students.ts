@@ -1,5 +1,6 @@
 // serverside/src/routes/students.ts — GET /students/template — COMPLETE
 
+import { REG_QUALIFIERS } from "../utils/academicRules";
 import { Router, Response }    from "express";
 import ExcelJS                 from "exceljs";
 import mongoose                from "mongoose";
@@ -22,8 +23,14 @@ import { ApiError }               from "../middleware/errorHandler";
 import { getIntakeDefinitions, resolveAdmissionIntake } from "../utils/intakeDefinitions";
 import { intakeCodesOf } from "../utils/semesterLabels";
 import { loadExistingByBase, splitRegNo } from "../utils/regNoQualifier";
+import { transferFromQualifier } from "../services/complianceTracking";
 import multer from "multer";
 import * as xlsxLib from "xlsx";
+
+/** Qualifiers doc: mid-entry students carry M2 / M3 when no qualifier was supplied. */
+const midEntryQualifier = (entryType: string): string =>
+  entryType === "Mid-Entry-Y2" ? REG_QUALIFIERS.midEntry(2)
+  : entryType === "Mid-Entry-Y3" ? REG_QUALIFIERS.midEntry(3) : "";
 
 const router = Router();
 
@@ -594,12 +601,15 @@ router.post(
     const existingByBase = await loadExistingByBase(Student, institutionId, incoming.map(s => s.regNo));
     const seenInBatch    = new Set<string>();
     
+    const regNoCache = new Map<string, Promise<unknown>>(); // one settings/programme read per upload
     const results = {
       registered: [] as string[],
       duplicates: [] as string[],
       errors:     [] as string[],
       /** existing students that had no qualifier and received one from this upload */
       qualifierUpdated: [] as string[],
+      /** things that are accepted but fall outside the regulations (ENG.25 weightings / qualifiers document) */
+      warnings: [] as string[],
     };
     const toCreate: Array<Record<string, unknown>> = [];
 
@@ -620,7 +630,7 @@ router.post(
 
       // Reg-no validation (server-side, authoritative)
       const validation = await validateRegNo(
-        s.regNo, institutionId.toString(), progDoc._id.toString(),
+        s.regNo, institutionId.toString(), progDoc._id.toString(), regNoCache,
       );
       if (!validation.valid) {
         results.errors.push(`${s.regNo}: ${validation.reason ?? "Invalid reg no format"}`);
@@ -631,6 +641,9 @@ router.post(
         s.yearOfStudy === 2 ? "Mid-Entry-Y2" :
         s.yearOfStudy === 3 ? "Mid-Entry-Y3" :
         s.yearOfStudy === 4 ? "Mid-Entry-Y4" : "Direct";
+
+        if (entryType === "Mid-Entry-Y4")
++        results.warnings.push(`${s.regNo}: entry into year 4 has no mid-entry weighting or qualifier in ENG.25 / the qualifiers document; direct-entry weights will be used.`);  
 
       const programType = progDoc.degreeType ?? "BSc";
 
@@ -654,7 +667,7 @@ router.post(
       if ("error" in adm) { results.errors.push(`${s.regNo}: ${adm.error}`); continue; }
 
       toCreate.push({
-        regNo: s.regNo, qualifierSuffix: s.qualifier, name: s.name, institution: institutionId,
+        regNo: s.regNo, qualifierSuffix: s.qualifier || midEntryQualifier(entryType), transfer: transferFromQualifier(s.qualifier), name: s.name, institution: institutionId,
         program: progDoc._id, programType, entryType,
         intake: adm.intake, currentYearOfStudy: s.yearOfStudy,
         admissionAcademicYear: finalYearId, status: "active",
@@ -839,6 +852,7 @@ router.post("/upload-excel",
     const currentYearIntakes = (currentYear?.intakeSemesters ?? []).map(m => m.intake);
 
     // ── Process rows ──────────────────────────────────────────────────────────
+    const regNoCache = new Map<string, Promise<unknown>>(); // one settings/programme read per upload
     const results = {
       registered: [] as string[],
       duplicates: [] as string[],
@@ -846,6 +860,8 @@ router.post("/upload-excel",
       skipped:    0,
       /** existing students that had no qualifier and received one from this file */
       qualifierUpdated: [] as string[],
+      /** things that are accepted but fall outside the regulations (ENG.25 weightings / qualifiers document) */
+      warnings: [] as string[],
     };
 
     const toCreate: Array<Record<string, unknown>> = [];
@@ -874,9 +890,7 @@ router.post("/upload-excel",
         programByCode.get(progRaw.toUpperCase());
 
       if (!progDoc) {
-        results.errors.push(
-          `Row ${rowNum} (${regNo}): Program "${progRaw}" not found in your department scope`,
-        );
+        results.errors.push(`Row ${rowNum} (${regNo}): Program "${progRaw}" not found in your department scope`);
         continue;
       }
 
@@ -885,6 +899,7 @@ router.post("/upload-excel",
         regNo,
         institutionId.toString(),
         progDoc._id.toString(),
+        regNoCache,
       );
       if (!validation.valid) {
         results.errors.push(`Row ${rowNum} (${regNo}): ${validation.reason}`);
@@ -906,10 +921,13 @@ router.post("/upload-excel",
         yearRaw === 2 ? "Mid-Entry-Y2" :
         yearRaw === 3 ? "Mid-Entry-Y3" :
         yearRaw === 4 ? "Mid-Entry-Y4" : "Direct";
-
+        if (entryType === "Mid-Entry-Y4")
+         results.warnings.push(`${regNo}: entry into year 4 has no mid-entry weighting or qualifier in ENG.25 / the qualifiers document; direct-entry weights will be used.`);
+        
       toCreate.push({
         regNo,
-        qualifierSuffix: qualifier,
+        qualifierSuffix: qualifier || midEntryQualifier(entryType),
+        transfer: transferFromQualifier(qualifier),
         name,
         institution: institutionId,
         program: progDoc._id,

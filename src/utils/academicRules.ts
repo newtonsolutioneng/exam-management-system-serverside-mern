@@ -600,3 +600,11 @@ export const getExamTypeTitle = (session: "ORDINARY" | "SUPPLEMENTARY" | "CLOSED
   session === "SUPPLEMENTARY"
     ? "SUPPLEMENTARY AND SPECIAL EXAMINATION RESULTS"
     : "ORDINARY EXAMINATION RESULTS";
+
+/** ENG.25(a): classification from the overall (weighted) average mark. */
+export const classifyWAA = (waa: number): string =>
+  waa >= 70 ? "FIRST CLASS HONOURS"
+  : waa >= 60 ? "SECOND CLASS HONOURS (UPPER DIVISION)"
+  : waa >= 50 ? "SECOND CLASS HONOURS (LOWER DIVISION)"
+  : waa >= 40 ? "PASS"
+  : "FAIL";    

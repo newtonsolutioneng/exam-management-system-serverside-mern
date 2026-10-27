@@ -1,6 +1,7 @@
 
 // serverside/src/utils/scoresheetStudentList.ts
 
+import { lapTimer } from "./perfLog";
 import mongoose from "mongoose";
 import type * as ExcelJS from "exceljs";
 import Student from "../models/Student";
@@ -86,6 +87,49 @@ async function _findPriorSpecialMark(studentId: string, puId: string): Promise<a
  
   return null;
 }
+
+// ─── Batch versions of the two look-ups above ─────────────────────────────────
+// One query per collection for the whole class instead of up to six per student (the per-student
+// version made a 500-student sheet take minutes). The decision rules are identical.
+interface UnitPrefetch { fg: Map<string, any[]>; md: Map<string, any[]>; dm: Map<string, any[]> }
+
+const _t = (d: any) => (d?.createdAt ? new Date(d.createdAt).getTime() : 0);
+
+export async function _prefetchUnit(studentIds: string[], puId: string): Promise<UnitPrefetch> {
+  const group = (docs: any[]) => {
+    const m = new Map<string, any[]>();
+    for (const d of docs) { const k = String(d.student); (m.get(k) ?? m.set(k, []).get(k)!).push(d); }
+    for (const list of m.values()) list.sort((a, b) => _t(b) - _t(a)); // newest first
+    return m;
+  };
+  if (!studentIds.length) return { fg: new Map(), md: new Map(), dm: new Map() };
+  const q = { student: { $in: studentIds }, programUnit: puId };
+  const [fg, md, dm] = await Promise.all([
+    FinalGrade.find(q).lean(), MarkDirect.find(q).lean(), Mark.find(q).lean(),
+  ]);
+  return { fg: group(fg as any[]), md: group(md as any[]), dm: group(dm as any[]) };
+}
+
+export function _statusFrom(pre: UnitPrefetch, sid: string, passMark: number): { status: string | null; mark: any | null } {
+  const fg = pre.fg.get(sid)?.[0];
+  if (fg) return { status: fg.status, mark: fg };
+  for (const md of [pre.md.get(sid)?.[0], pre.dm.get(sid)?.[0]]) {
+    if (!md) continue;
+    const isSpecial = md.isSpecial || md.attempt === "special";
+    return { status: isSpecial ? "SPECIAL" : (md.agreedMark ?? 0) >= passMark ? "PASS" : "SUPPLEMENTARY", mark: md };
+  }
+  return { status: null, mark: null };
+}
+
+export function _priorSpecialFrom(pre: UnitPrefetch, sid: string): any | null {
+  const fg = pre.fg.get(sid)?.find((d) => d.status === "SPECIAL");
+  if (fg && (fg.caTotal30 ?? 0) > 0) return { ...fg, _source: "finalGrade" };
+  const dm = pre.dm.get(sid)?.find((d) => d.isSpecial === true);
+  if (dm && (dm.caTotal30 ?? 0) > 0) return { ...dm, _source: "detailed" };
+  const md = pre.md.get(sid)?.find((d) => d.attempt === "special");
+  if (md && (md.caTotal30 ?? 0) > 0) return { ...md, _source: "direct" };
+  return null;
+}
  
 // ─── Derive attempt flags from a mark ────────────────────────────────────────
 function _flagsFromMark(
@@ -135,9 +179,11 @@ export const buildScoresheetStudentList = async (params: {
 }): Promise<ScoresheetStudent[]> => {
   const { programId, programUnitId, yearOfStudy, academicYearId, session, passMark } = params;
  
+  const lap = lapTimer("scoresheet student list");
   const academicYear = await AcademicYear.findById(academicYearId).lean() as any;
   if (!academicYear) throw new Error("Academic year not found");
- 
+  lap("academic year");
+
   const result:   ScoresheetStudent[] = [];
   const addedIds: Set<string>         = new Set();
  
@@ -182,6 +228,7 @@ export const buildScoresheetStudentList = async (params: {
       ...detailedIds.map((id: any) => id.toString()),
       ...directIds.map((id: any) => id.toString()),
     ])];
+    lap("marked ids");
  
     if (allMarkedIds.length > 0) {
       const studentsWithMarks = await Student.find({
@@ -189,12 +236,16 @@ export const buildScoresheetStudentList = async (params: {
         status: { $nin: EXCLUDED },
       }).sort({ regNo: 1 }).lean() as any[];
  
-      for (const student of studentsWithMarks) {
-        const { mark } = await _resolveUnitStatus(student._id.toString(), programUnitId.toString(), passMark);
-        const priorSpecial = mark?.isSpecial
-          ? await _findPriorSpecialMark(student._id.toString(), programUnitId.toString())
-          : null;
-        const flags = _flagsFromMark(mark, student.status, priorSpecial);
+      const preMarked = await _prefetchUnit(studentsWithMarks.map((st: any) => st._id.toString()), programUnitId.toString());
+      const looked = studentsWithMarks.map((student: any) => {
+        const sid = student._id.toString();
+        const { mark } = _statusFrom(preMarked, sid, passMark);
+        return { mark, priorSpecial: mark?.isSpecial ? _priorSpecialFrom(preMarked, sid) : null };
+                });
+                for (let i = 0; i < studentsWithMarks.length; i++) {
+                  const student = studentsWithMarks[i];
+                  const { mark, priorSpecial } = looked[i];
+                   const flags = _flagsFromMark(mark, student.status, priorSpecial);
         add(student, flags.attemptLabel, flags, flags.prevMark ?? mark ?? undefined);
       }
     }
@@ -210,18 +261,18 @@ export const buildScoresheetStudentList = async (params: {
         _id:                { $nin: allMarkedIds },
       }).sort({ regNo: 1 }).lean() as any[];
  
-      for (const student of currentStudents) {
-        // KEY: check if student already PASSED this unit in any prior year
-        const { status: priorStatus } = await _resolveUnitStatus(
-          student._id.toString(), programUnitId.toString(), passMark,
-        );
- 
-        if (priorStatus === "PASS") continue; // already passed — skip
- 
-        // Check for deferred special
-        const priorSpecial = await _findPriorSpecialMark(
-          student._id.toString(), programUnitId.toString(),
-        );
+      const preCurrent = await _prefetchUnit(currentStudents.map((st: any) => st._id.toString()), programUnitId.toString());
+      const lookedCurrent = currentStudents.map((student: any) => {
+        const sid = student._id.toString();
+        const { status: priorStatus } = _statusFrom(preCurrent, sid, passMark);
+        return { priorStatus, priorSpecial: priorStatus === "PASS" ? null : _priorSpecialFrom(preCurrent, sid) };
+      });
+      for (let i = 0; i < currentStudents.length; i++) {
+        const student = currentStudents[i];
+        const { priorStatus, priorSpecial } = lookedCurrent[i];
+
+        // a student who already PASSED this unit in any prior year is skipped
+        if (priorStatus === "PASS") continue;
  
         if (priorSpecial) {
           add(student, ATTEMPT.SPECIAL, { isSpecial: true, isCarriedSpecial: true }, priorSpecial);
@@ -234,6 +285,7 @@ export const buildScoresheetStudentList = async (params: {
       }
     }
  
+    lap("current students");
     // Carry-forward students (ENG.14) — already filtered by programUnitId
     try {
       const cfStudents = await getCarryForwardStudentsForUnit(
@@ -245,6 +297,7 @@ export const buildScoresheetStudentList = async (params: {
       }
     } catch { }
  
+    lap("carry-forward");
     // Stayout students (ENG.15h) — already filtered by programUnitId
     try {
       const stayoutStudents = await getStayoutStudentsForUnit(
@@ -256,6 +309,7 @@ export const buildScoresheetStudentList = async (params: {
       }
     } catch { }
  
+    lap("stayout");
     // ── NEW: Deferred-supp/special students (ENG.13b / ENG.18c) ─────────────
     // Students from a HIGHER year who have a pending deferred supp or special
     // for THIS specific programUnit. They were promoted despite the pending unit
@@ -355,6 +409,8 @@ export const buildScoresheetStudentList = async (params: {
     }
   }
  
+  lap("deferred / supplementary");
+  lap.done();
   // Sort: primary (1), CF (2), stayout/deferred (3)
   // ── Students outside the main class (coordinator-supplied reg nos) ─────────
   for (const raw of params.extraRegNos ?? []) {

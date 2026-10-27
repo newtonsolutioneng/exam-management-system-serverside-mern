@@ -31,7 +31,10 @@ export const calculateFinalResult = (input: GradingInput) => {
 
   // 2. CA Calculation
   let caTotal = 0;
-  if (attempt.toLowerCase() === "supp" || attempt.toLowerCase() === "supplementary") {
+  // ENG 13(e): a unit assessed wholly by coursework (examMax 0) is supplemented by extra coursework, so CA counts.
+  const isSuppSitting = attempt.toLowerCase() === "supp" || attempt.toLowerCase() === "supplementary";
+  const caOnlyUnit = input.examMax === 0;
+  if (isSuppSitting && !caOnlyUnit) {
     caTotal = 0; // Rule ENG 13.f: Supps ignore CA
   } else if (unitType !== "workshop") {
     const avgCat = (cat1 + cat2 + (cat3 || 0)) / (cat3 ? 3 : 2);
@@ -61,8 +64,8 @@ export const calculateFinalResult = (input: GradingInput) => {
   let finalMark = Math.round(unroundedTotal);
 
   // 5. Supplementary Capping
-  if (attempt.toLowerCase() === "supp" || attempt.toLowerCase() === "supplementary") {
-    finalMark = Math.min(settings.passMark, Math.round(examWeighted));
+  if (isSuppSitting) {
+    finalMark = Math.min(settings.passMark, Math.round(caOnlyUnit ? caTotal : examWeighted));
   }
 
   return {

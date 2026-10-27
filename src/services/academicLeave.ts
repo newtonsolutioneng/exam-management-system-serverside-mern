@@ -1,19 +1,23 @@
 // serverside/src/services/academicLeave.ts
 import Student from "../models/Student";
 import { differenceInYears, format, } from "date-fns";
-
+import { REG_QUALIFIERS } from "../utils/academicRules";
+import { loadInstitutionSettings } from "../utils/loadInstitutionSettings";
+ 
 // --- IMPLEMENTING ACADEMIC LEAVE (ENG. 19) ---
 export const grantAcademicLeave = async ( 
   studentId: string, startDate: Date, endDate: Date, reason: string, leaveType: "compassionate" | "financial" | "other") => {
   const student = await Student.findById(studentId).populate("program");
   if (!student) throw new Error("Student not found");
 
-  // Calculate duration to check max stay-out
-  const yearsRequested = differenceInYears(endDate, startDate);
+  // Calculate duration to check max stay-out (fractions of a year count)
+  const yearsRequested = Math.max(0, Math.round(((endDate.getTime() - startDate.getTime()) / (365.25 * 24 * 3600 * 1000)) * 100) / 100);
 
-  // ENG 19.d/e: Max stay-out check (10 yrs Eng / 8 yrs Ed)
+  // ENG 19(d)/(e): max stay-out = programme length x multiplier (5 yrs -> 10, 4 yrs -> 8), the same
+  // rule the daily compliance job uses. Never inferred from the programme's name.
   const program = student.program as any;
-  const maxStayOut = program.name.includes("Engineering") ? 10 : 8;
+  const settings = await loadInstitutionSettings(String((student as any).institution)).catch(() => null);
+  const maxStayOut = Math.round((program.durationYears ?? 5) * (settings?.rules.maxDurationMultiplier ?? 2));
 
   if ((student.totalTimeOutYears || 0) + yearsRequested > maxStayOut) {
     throw new Error(`Leave denied: Exceeds max stay-out period of ${maxStayOut} years.`);
@@ -123,7 +127,7 @@ export const revertStatusToActive = async (studentId: string) => {
 };
 
 // --- IMPLEMENTING READMISSION (ENG. 23 / 24) ---
-export const readmitStudent = async (studentId: string, remarks: string) => {
+export const readmitStudent = async (studentId: string, remarks: string, secondSemester = false) => {
   const student = await Student.findById(studentId);
   if (!student) throw new Error("Student not found");
 
@@ -138,11 +142,18 @@ export const readmitStudent = async (studentId: string, remarks: string) => {
   const lastHistory = student.academicHistory?.slice(-1)[0];
   const currentAY = lastHistory?.academicYear || "NEW CYCLE";
 
+  // ENG.21 / qualifiers doc: RA{n} (n = readmissions so far, max 5); RA{n}S2 when the
+  // student re-enters at the second semester (first semester of the year already completed).
+  const priorReadmissions = ((student as any).statusEvents || []).filter(
+    (e: any) => typeof e?.reason === "string" && e.reason.startsWith("OFFICIAL READMISSION"),
+  ).length;
+  const raQualifier = REG_QUALIFIERS.readmit(priorReadmissions + 1, secondSemester);
+
   return await Student.findByIdAndUpdate(
     studentId,
     {
-      $set: { status: "active", remarks: `READMITTED: ${remarks} (Prev: ${previousStatus})`},
-      $push: {        
+      $set: { status: "active", qualifierSuffix: raQualifier, remarks: `READMITTED: ${remarks} (Prev: ${previousStatus}) ${raQualifier}`},
+       $push: {        
         statusEvents: { fromStatus: previousStatus, toStatus: "active", date: now, academicYear: currentAY, reason: `OFFICIAL READMISSION: ${remarks}`},
         // 2. Track the return in Promotion History
         promotionHistory: { from: student.currentYearOfStudy, to: student.currentYearOfStudy, date: now, remarks: `READMISSION FROM ${previousStatus}`}

@@ -1,4 +1,5 @@
 // serverside/src/utils/directTemplate.ts
+import { lapTimer } from "./perfLog";
 import * as ExcelJS from "exceljs";
 import Program from "../models/Program";
 import Unit from "../models/Unit";
@@ -24,6 +25,7 @@ export const generateDirectScoresheetTemplate = async (
   unitType:       "theory" | "lab" | "workshop" = "theory",
   examMode:       "standard" | "mandatory_q1" = "standard",
  ): Promise<Buffer> => {
+  const lap = lapTimer("direct scoresheet");
   const [program, unit, academicYear] = await Promise.all([
     Program.findById(programId).lean()           as Promise<any>,
     Unit.findById(unitId).lean()                 as Promise<any>,
@@ -31,7 +33,9 @@ export const generateDirectScoresheetTemplate = async (
   ]);
 
   // const settings = await InstitutionSettings.findOne({ institution: program?.institution }).lean() as any;
+  lap("program/unit/year");
   const settings = await loadInstitutionSettings(program?.institution);
+  lap("settings");
   // if (!settings)     throw new Error("Institution settings not found.");
   if (!academicYear) throw new Error("Academic Year not found.");
   if (!unit)         throw new Error("Unit not found.");
@@ -48,12 +52,14 @@ export const generateDirectScoresheetTemplate = async (
     academicYear.session === "SUPPLEMENTARY" ? "SUPPLEMENTARY" :
     academicYear.session === "CLOSED"        ? "CLOSED"        : "ORDINARY";
 
+  lap("programUnit");  
   const eligibleStudents: ScoresheetStudent[] = await buildScoresheetStudentList({
     programId, programUnitId: programUnitDoc?._id ?? unitId,
     unitId, yearOfStudy, academicYearId, session, passMark,
     extraRegNos, institutionId: program?.institution,
   });
 
+  lap("student list");
   const dist = resolveDistribution(distribution, unit?.markDistribution, unitType);
 
   const studentIds = eligibleStudents.map((s) => s.studentId);
@@ -61,6 +67,7 @@ export const generateDirectScoresheetTemplate = async (
     ? await getExistingMarksForStudents(studentIds, programUnitDoc._id)
     : new Map<string, any>();
 
+  lap("existing marks");
   const workbook   = new ExcelJS.Workbook();
   const sheet      = workbook.addWorksheet(`${unit.code}`.trim().substring(0, 31));
   const fontName   = "Book Antiqua";
@@ -201,6 +208,8 @@ export const generateDirectScoresheetTemplate = async (
   sheet.views = [{ state: "frozen", xSplit: 4, ySplit: 16 }];
   sheet.protect("1234", { selectLockedCells: true, selectUnlockedCells: true });
 
+  lap("build sheet");
   const buf = await workbook.xlsx.writeBuffer();
+  lap("write file"); lap.done();
   return Buffer.from(buf as ArrayBuffer);
 };

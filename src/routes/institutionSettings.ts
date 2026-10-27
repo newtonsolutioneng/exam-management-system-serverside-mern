@@ -1,4 +1,5 @@
 // serverside/src/routes/institutionSettings.ts — COMPLETE, FINAL VERSION
+import { legacyFieldsFromExample } from "../utils/regNoShape";
 import express, { Response } from "express";
 import InstitutionSettings   from "../models/InstitutionSettings";
 import Program from "../models/Program";
@@ -502,6 +503,14 @@ router.patch(
 
     if (!Array.isArray(regNoPatterns)) {
       throw { statusCode: 400, message: "regNoPatterns must be an array" } as ApiError;
+    }
+
+    // Normalise: the example is the source of truth; the old fields are derived from it.
+    for (const p of regNoPatterns) {
+      if (p.example?.trim()) {
+        p.example = p.example.trim().toUpperCase();
+        Object.assign(p, legacyFieldsFromExample(p.example));
+      }
     }
 
     await InstitutionSettings.updateOne(

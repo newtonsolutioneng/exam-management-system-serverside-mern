@@ -24,6 +24,8 @@ export interface RowContext {
   distribution: MarkDistribution;
   unitType: UnitKind;
   examMode: ExamModeKind;
+  /** students of this sheet, loaded in one query (base reg no -> lean student); falls back to a per-row query */
+  students?: Map<string, Record<string, any>>;
 }
 
 export type ProgramUnitMap = Map<string, Record<string, unknown>>;
@@ -89,7 +91,7 @@ export async function processResultRow(
   const { base: regNo } = splitRegNo(regNoOverride ?? row[1]);
   const unit = ctx.unitCode;
 
-  const student = (await findStudentByRegNo(Student, regNo, ctx.institutionId)) as Record<string, any> | null;
+  const student = (ctx.students?.get(regNo) ?? (await findStudentByRegNo(Student, regNo, ctx.institutionId))) as Record<string, any> | null;
   if (!student) return fail("STUDENT_NOT_FOUND", regNo, `Student ${regNo} is not registered.`, unit);
   const programId = String(student.program);
 
@@ -147,6 +149,8 @@ export async function processResultRow(
     if (detailed) {
       const raws: Record<string, number> = {};
       for (const [field, idx] of Object.entries(COL.detailed.raws)) {
+        // ENG.10(d): a blank practical cell means "not recorded", not a score of 0.
+        if (field === "practicalRaw" && blank(cell(row, idx))) continue;
         const v = num(cell(row, idx));
         if (Number.isNaN(v)) return fail("INVALID_MARK", regNo, `${field.replace("Raw", "")} is not a number.`, unit, programId);
         raws[field] = v;

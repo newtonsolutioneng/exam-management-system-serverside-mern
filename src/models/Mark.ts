@@ -36,6 +36,8 @@ export interface IMark extends Document {
   attempt: string; // "1st", "re-take", "supplementary"
   examMode: "standard" | "mandatory_q1";
   unitType?: "theory" | "lab" | "workshop";
+  /** ENG.10(d): practical component not passed — the unit is failed whatever the total. */
+  practicalFailed?: boolean;
   /** Mark distribution this sheet was captured under (ca + exam = 100). Absent on legacy rows = 30/70. */
   caMax?: number;
   examMax?: number;
@@ -50,6 +52,7 @@ export interface IMark extends Document {
   uploadedBy: mongoose.Types.ObjectId; // coordinator who entered
   uploadedAt: Date; 
   deletedAt?:    Date;
+  nullificationId?: mongoose.Types.ObjectId | null;
 }
 
 const schema = new Schema<IMark>(
@@ -83,8 +86,9 @@ const schema = new Schema<IMark>(
     caTotal30: { type: Number, min: 0, max: 100, required: true },
     examTotal70: { type: Number, min: 0, max: 100, required: true },
     caMax: { type: Number, min: 0, max: 99 },
-    examMax: { type: Number, min: 1, max: 100 },
+    examMax: { type: Number, min: 0, max: 100 },
     unitType: { type: String, enum: ["theory", "lab", "workshop"] },
+    practicalFailed: { type: Boolean, default: false },
     internalExaminerMark: { type: Number, min: 0, max: 100, required: false },
     agreedMark: { type: Number, min: 0, max: 100, required: true },
     attempt: { type: String, enum: ["1st", "re-take", "supplementary", "special"], default: "1st", },
@@ -98,7 +102,9 @@ const schema = new Schema<IMark>(
     uploadedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     uploadedAt: { type: Date, default: Date.now },
     deletedAt: { type: Date, default: null },
-    
+    /** ENG.17: set when the result was nullified; such rows cannot be restored from the Bin. */
+    nullificationId: { type: Schema.Types.ObjectId, ref: "Nullification", default: null },
+
   },
   { timestamps: true }
 );

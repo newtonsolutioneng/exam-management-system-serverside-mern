@@ -1,12 +1,15 @@
 
 // serverside/src/services/graduationEngine.ts
 
+import { mapLimit } from "../utils/mapLimit";
 import Student from "../models/Student";
 import FinalGrade from "../models/FinalGrade";
 import MarkDirect from "../models/MarkDirect";
 import Mark from "../models/Mark";
 import ProgramUnit from "../models/ProgramUnit";
 import { getYearWeight } from "../utils/weightingRegistry";
+import { classifyWAA } from "../utils/academicRules";
+import { outstandingAttachments } from "./attachments";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -72,6 +75,33 @@ export async function resolveAgreedMark(
   return 0; // no mark found
 }
 
+/** Same rules as resolveAgreedMark, for many programme units in 3 queries instead of 3 per unit. */
+export async function resolveAgreedMarksBatch(studentId: string, puIds: string[]): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (!puIds.length) return out;
+  const [fgs, mds, dms] = await Promise.all([
+    FinalGrade.find({ student: studentId, programUnit: { $in: puIds } }).lean() as Promise<any[]>,
+    MarkDirect.find({ student: studentId, programUnit: { $in: puIds } }).lean() as Promise<any[]>,
+    Mark.find({ student: studentId, programUnit: { $in: puIds } }).lean() as Promise<any[]>,
+  ]);
+  const group = (docs: any[]) => {
+    const m = new Map<string, any[]>();
+    for (const d of docs) { const k = String(d.programUnit); (m.get(k) ?? m.set(k, []).get(k)!).push(d); }
+    return m;
+  };
+  const fgBy = group(fgs), mdBy = group(mds), dmBy = group(dms);
+  const rank = (st: string) => st === "PASS" ? 3 : st === "SPECIAL" ? 2 : st === "SUPPLEMENTARY" ? 1 : 0;
+  for (const id of puIds) {
+    let mark = 0;
+    const f = fgBy.get(id);
+    if (f?.length) { const best = [...f].sort((a, b) => rank(b.status) - rank(a.status))[0]; if ((best.totalMark ?? 0) > 0) mark = best.totalMark; }
+    if (!mark) { const md = mdBy.get(id)?.[0]; if (md && (md.agreedMark ?? 0) > 0) mark = md.agreedMark; }
+    if (!mark) { const dm = dmBy.get(id)?.[0]; if (dm && (dm.agreedMark ?? 0) > 0) mark = dm.agreedMark; }
+    out.set(id, mark);
+  }
+  return out;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Core WAA computer
 //
@@ -81,7 +111,7 @@ export async function resolveAgreedMark(
 //   3. Recompute from actual marks (FinalGrade + MarkDirect + Mark fallback)
 //      and backfill the DB so future calls use Priority 1.
 // ─────────────────────────────────────────────────────────────────────────────
-async function computeWAA(student: any): Promise<{
+async function computeWAA(student: any, opts: { force?: boolean } = {}): Promise<{
   waa:           number;
   yearBreakdown: GraduationResult["yearBreakdown"];
 }> {
@@ -90,7 +120,7 @@ async function computeWAA(student: any): Promise<{
   const entryType = student.entryType || "Direct";
 
   // ── Priority 1: finalWeightedAverage ─────────────────────────────────────
-  if (student.finalWeightedAverage != null) {
+  if (!opts.force && student.finalWeightedAverage != null) {
     const stored = parseFloat(student.finalWeightedAverage);
     if (stored > 0) {
       const yearBreakdown = history.map((h: any) => ({
@@ -111,7 +141,7 @@ async function computeWAA(student: any): Promise<{
     (sum: number, h: any) => sum + (h.weightedContribution || 0),
     0,
   );
-  if (totalStoredWC > 0) {
+  if (!opts.force && totalStoredWC > 0) {
     const yearBreakdown = history.map((h: any) => ({
       yearOfStudy:          h.yearOfStudy,
       academicYear:         h.academicYear || "",
@@ -146,9 +176,13 @@ async function computeWAA(student: any): Promise<{
     let   totalMark = 0;
     let   resolved  = 0; // how many units have a mark
 
+    const marksByUnit = await resolveAgreedMarksBatch(
+      student._id.toString(), programUnits.map((pu: any) => pu._id.toString()),
+    );
+
     for (const pu of programUnits) {
       const puId = (pu as any)._id.toString();
-      const mark = await resolveAgreedMark(student._id.toString(), puId);
+      const mark = marksByUnit.get(puId) ?? 0;
       if (mark > 0) {
         totalMark += mark;
         resolved++;
@@ -175,11 +209,27 @@ async function computeWAA(student: any): Promise<{
   }
 
   // Backfill DB (fire-and-forget)
-  _backfillStudentWAA(student._id, waa, historyUpdates).catch((err: Error) =>
+  const backfill = _backfillStudentWAA(student._id, waa, historyUpdates).catch((err: Error) =>
     console.warn(`[graduationEngine] Backfill failed for ${student.regNo}:`, err.message),
   );
+  if (opts.force) await backfill; // a refresh must be finished before the caller reads the result
 
   return { waa: parseFloat(waa.toFixed(2)), yearBreakdown };
+}
+
+/**
+ * Recompute a student's weighted average from the CURRENT marks and store it.
+ * Call after a mark is edited: the stored finalWeightedAverage / weightedContribution would otherwise
+ * keep showing the old figures on the award list and graduation screens.
+ */
+export async function refreshStudentWAA(studentId: unknown): Promise<number | null> {
+  const student = await Student.findById(studentId).populate("program").lean() as any;
+  if (!student) return null;
+  const hasStored = student.finalWeightedAverage != null ||
+    (student.academicHistory || []).some((h: any) => (h.weightedContribution || 0) > 0);
+  if (!hasStored) return null; // nothing stored yet; it will be computed from the marks on demand
+  const { waa } = await computeWAA(student, { force: true });
+  return waa;
 }
 
 // ─── DB backfill ──────────────────────────────────────────────────────────────
@@ -198,10 +248,7 @@ async function _backfillStudentWAA(
     return { ...h, annualMeanMark: upd.annualMean, weightedContribution: upd.wc };
   });
 
-  let classification = "PASS";
-  if      (waa >= 70) classification = "FIRST CLASS HONOURS";
-  else if (waa >= 60) classification = "SECOND CLASS HONOURS (UPPER DIVISION)";
-  else if (waa >= 50) classification = "SECOND CLASS HONOURS (LOWER DIVISION)";
+  const classification = classifyWAA(waa);
 
   await Student.findByIdAndUpdate(studentId, {
     $set: {
@@ -243,6 +290,7 @@ export const calculateGraduationStatus = async (
       `${pendingCF.length} carry-forward unit(s) pending: ${pendingCF.map((u: any) => u.unitCode).join(", ")}`,
     );
   }
+  for (const a of await outstandingAttachments(student._id)) missingRequirements.push(`${a} not passed (ENG.24)`);
   if (!["graduand","graduated"].includes(student.status) && missingRequirements.length === 0) {
     missingRequirements.push(`Student status is "${student.status}" — must be "graduand" or "graduated"`);
   }
@@ -280,15 +328,18 @@ export const generateAwardList = async (
 
   const awardList: AwardListEntry[] = [];
 
-  for (const student of students) {
-    if (academicYear) {
-      const lastHistory = (student.academicHistory || []).at(-1);
-      const lastYear    = lastHistory?.academicYear || "";
-      if (!lastYear.includes(academicYear) && student.graduationYear !== parseInt(academicYear)) continue;
-    }
-
-    const { waa } = await computeWAA(student);
-
+  const inScope = students.filter((student) => {
+    if (!academicYear) return true;
+    const lastYear = (student.academicHistory || []).at(-1)?.academicYear || "";
+    return lastYear.includes(academicYear) || student.graduationYear === parseInt(academicYear);
+  });
+  // students are independent; compute a few at a time (matters for large classes)
+  const waas = await mapLimit(inScope, 8, (student) => computeWAA(student));
+     
+  for (let idx = 0; idx < inScope.length; idx++) {
+    const student = inScope[idx];
+    const { waa } = waas[idx];
+    
     let classification = student.classification || "";
     if (!classification || (classification === "PASS" && waa > 50)) {
       if      (waa >= 70) classification = "FIRST CLASS HONOURS";

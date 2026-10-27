@@ -17,6 +17,10 @@ export interface IAcademicYear extends Document {
   // Session control for ENG 13/18
   session: "ORDINARY" | "SUPPLEMENTARY" | "CLOSED";
   isRegistrationOpen: boolean;    // Unit registration window
+  // First day of each semester; ENG.23(a)/(d) deadlines are counted from here.
+  semesterStarts?: Array<{ semester: 1 | 2 | 3; startDate: Date }>;
+  // ENG.27(ii): when the results were released to students; the ENG.26 appeal window runs from here.
+  resultsReleasedAt?: Date | null;
 }
 
 const schema = new Schema<IAcademicYear>({
@@ -44,7 +48,12 @@ const schema = new Schema<IAcademicYear>({
     enum: ["ORDINARY", "SUPPLEMENTARY", "CLOSED"], 
     default: "ORDINARY" 
   },
-  isRegistrationOpen: { type: Boolean, default: true }
+  isRegistrationOpen: { type: Boolean, default: true },
+  resultsReleasedAt: { type: Date, default: null },
+  semesterStarts: {
+    type: [new Schema({ semester: { type: Number, enum: [1, 2, 3], required: true }, startDate: { type: Date, required: true } }, { _id: false })],
+    default: [],
+  },
 });
 
 schema.index({ institution: 1, year: 1 }, { unique: true });

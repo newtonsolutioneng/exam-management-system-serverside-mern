@@ -6,6 +6,7 @@
 //      and populates deferredList — so the status box reflects post-defer reality
 //   3. academicYearName is always returned (fixes the 400 on defer submit)
 
+import { mapLimit } from "../utils/mapLimit";
 import FinalGrade from "../models/FinalGrade";
 import ProgramUnit from "../models/ProgramUnit";
 import Student from "../models/Student";
@@ -14,9 +15,10 @@ import InstitutionSettings from "../models/InstitutionSettings";
 import MarkDirect from "../models/MarkDirect";
 import AcademicYear from "../models/AcademicYear";
 import { getYearWeight } from "../utils/weightingRegistry";
-import { performAcademicAudit } from "./academicAudit";
-import { getAttemptLabel, REG_QUALIFIERS } from "../utils/academicRules";
+import { performAcademicAudit, applyRepeatUnitRule } from "./academicAudit";
+import { getAttemptLabel, REG_QUALIFIERS, classifyWAA } from "../utils/academicRules";
 import { validateHistoricalYears } from "./historicalYearValidator";
+import { outstandingAttachments } from "./attachments";
 
 function _qualifierShouldClearOnPromotion(qualifier: string): boolean {
   if (!qualifier || qualifier.trim() === "") return false;
@@ -95,17 +97,33 @@ export interface StudentStatusResult {
 }
 
 // ── calculateStudentStatus ────────────────────────────────────────────────────
-
 export const calculateStudentStatus = async (
   studentId: any, programId: any, academicYearName: string,
-  yearOfStudy: number = 1, options: { forPromotion?: boolean } = {},
-): Promise<StudentStatusResult> => {
-
-  const settings = await InstitutionSettings.findOne().lean();
+  yearOfStudy: number = 1,
+  /** `memo`: pass one Map per request (e.g. a promotion analysis) so class-wide look-ups are read once, not once per student. */
+  options: {
+        forPromotion?: boolean;
+        memo?: Map<string, Promise<any>>;
+        /** records the caller already loaded for the whole class; skips this student's own queries */
+        prefetched?: { student: any; detailed: any[]; direct: any[]; grades: any[] };
+      } = {},
+ ): Promise<StudentStatusResult> => {
+  const memo = <T>(key: string, load: () => Promise<T>): Promise<T> => {
+    if (!options.memo) return load();
+    if (!options.memo.has(key)) options.memo.set(key, load());
+    return options.memo.get(key) as Promise<T>;
+  };
+ 
+  const settings = await memo("settings", async () => InstitutionSettings.findOne().lean());
   if (!settings) throw new Error("Institution settings not found.");
   const passMark = (settings as any).passMark || 40;
 
-  const student = await Student.findById(studentId).lean();
+  // ENG 23(c): absences that trigger deregistration (setting, default 6)
+  const maxAbsent = (settings as any).ruleSet?.maxAbsentExams ?? 6;
+  // ENG.10(e): a missed exam scores 0 (the unit is failed) instead of being listed as missing. Off by default.
+  const enforcePractical = (settings as any).ruleSet?.enforcePracticalPass === true;
+  const missedExamZero = (settings as any).ruleSet?.missedExamScoresZero === true;
+  const student = options.prefetched?.student ?? await Student.findById(studentId).lean();
   if (!student) throw new Error("Student not found");
 
   // ── Terminal gate ─────────────────────────────────────────────────────────
@@ -146,17 +164,18 @@ export const calculateStudentStatus = async (
     targetYearDoc = (await AcademicYear.findOne({ isCurrent: true }).lean())
       || (await AcademicYear.findOne().sort({ startDate: -1 }).lean());
   } else {
-    targetYearDoc = (await AcademicYear.findOne({ year: academicYearName }).lean())
-      || (await AcademicYear.findOne({ year: { $regex: new RegExp(`^${academicYearName.replace("/", "\\/")}$`, "i") } }).lean());
+    targetYearDoc = await memo(`year:${academicYearName}`, async () =>
+      (await AcademicYear.findOne({ year: academicYearName }).lean())
+      || (await AcademicYear.findOne({ year: { $regex: new RegExp(`^${academicYearName.replace("/", "\\/")}$`, "i") } }).lean()));
     if (!targetYearDoc) console.warn(`[StatusEngine] AcademicYear "${academicYearName}" not found.`);
   }
 
   const resolvedYearName: string = targetYearDoc?.year ?? academicYearName ?? "";
 
   // ── Curriculum ────────────────────────────────────────────────────────────
-  const curriculum = await ProgramUnit.find({ program: programId, requiredYear: yearOfStudy })
-    .populate("unit").lean() as any[];
-
+  const curriculum = await memo(`curriculum:${programId}:${yearOfStudy}`, async () =>
+    ProgramUnit.find({ program: programId, requiredYear: yearOfStudy }).populate("unit").lean()) as any[];
+  
   if (!curriculum?.length) {
     return {
       status: "CURRICULUM NOT SET", variant: "info", details: `No units defined for Year ${yearOfStudy}.`,
@@ -169,7 +188,9 @@ export const calculateStudentStatus = async (
 
   const programUnitIds = curriculum.map((pu: any) => pu._id);
 
-  const [detailedMarks, directMarks, finalGrades] = await Promise.all([
+  const [detailedMarks, directMarks, finalGrades] = options.prefetched
+    ? [options.prefetched.detailed, options.prefetched.direct, options.prefetched.grades]
+    : await Promise.all([
     Mark.find({ student: studentId, programUnit: { $in: programUnitIds } }).lean(),
     MarkDirect.find({ student: studentId, programUnit: { $in: programUnitIds } }).lean(),
     FinalGrade.find({ student: studentId, programUnit: { $in: programUnitIds } }).lean(),
@@ -232,6 +253,9 @@ export const calculateStudentStatus = async (
     incomplete: [] as string[],
   };
   let totalFirstAttemptSum = 0;
+  // ENG.23(c): absences are counted per semester.
+  const absentBySem = new Map<number, number>();
+  const countAbsent = (sem: unknown) => { const k = Number(sem) || 1; absentBySem.set(k, (absentBySem.get(k) || 0) + 1); };
 
   curriculum.forEach((pUnit: any) => {
     const code          = pUnit.unit?.code?.toUpperCase();
@@ -239,10 +263,12 @@ export const calculateStudentStatus = async (
     const programUnitId = pUnit._id.toString();
     const rawMark       = marksMap.get(programUnitId);
 
-    if (!rawMark) { lists.missing.push(displayName); return; }
+    if (!rawMark) { lists.missing.push(displayName); countAbsent(pUnit.requiredSemester); return; }
 
     const hasCAT  = (rawMark.caTotal30  || 0) > 0;
-    const hasExam = (rawMark.examTotal70 || 0) > 0;
+    // ENG.10(b): a unit assessed solely by coursework has examMax 0 — no exam is expected.
+    const caOnlyUnit = rawMark.examMax === 0;
+    const hasExam = caOnlyUnit || (rawMark.examTotal70 || 0) > 0;
     const markVal = rawMark.agreedMark || 0;
     const isSupp  = rawMark.attempt === "supplementary";
     const isSpc   = rawMark.attempt === "special" || rawMark.isSpecial === true;
@@ -257,18 +283,25 @@ export const calculateStudentStatus = async (
       lists.special.push({ displayName, grounds: rawMark.remarks || "Special", programUnitId });
     } else if (!hasCAT && !hasExam) {
       lists.missing.push(`${displayName} (Absent)`);
+      countAbsent(pUnit.requiredSemester);
     } else if (!hasCAT && hasExam) {
       if (isSupp) {
-        if (markVal >= passMark) lists.passed.push({ code, mark: markVal });
+        if (markVal >= passMark && !(enforcePractical && rawMark.practicalFailed)) lists.passed.push({ code, mark: markVal });
         else                     lists.failed.push({ displayName, attempt: notation, programUnitId });
         totalFirstAttemptSum += markVal;
       } else {
         lists.incomplete.push(`${displayName} (No CAT)`);
       }
     } else if (!hasExam && hasCAT) {
-      lists.missing.push(`${displayName} (Missing Exam)`);
+      countAbsent(pUnit.requiredSemester);
+      if (missedExamZero) {
+        lists.failed.push({ displayName: `${displayName}`, attempt: notation, programUnitId });
+        totalFirstAttemptSum += markVal;
+      } else {
+        lists.missing.push(`${displayName} (Missing Exam)`);
+      }
     } else {
-      if (markVal >= passMark) lists.passed.push({ code, mark: markVal });
+      if (markVal >= passMark && !(enforcePractical && rawMark.practicalFailed)) lists.passed.push({ code, mark: markVal });
       else                     lists.failed.push({ displayName, attempt: notation, programUnitId });
       totalFirstAttemptSum += markVal;
     }
@@ -340,8 +373,8 @@ export const calculateStudentStatus = async (
 
   if (!options.forPromotion && targetSession === "ORDINARY" && !isPastYear) {
     status = "SESSION IN PROGRESS"; variant = "info"; details = "Marks are currently being entered.";
-  } else if (missingCount >= 6 && isSessionClosed) {
-    status = "DEREGISTERED"; variant = "error"; details = `Absent from 6+ (${missingCount}) examinations (ENG 23c).`;
+  } else if (Math.max(0, ...absentBySem.values()) >= maxAbsent && isSessionClosed) {
+    status = "DEREGISTERED"; variant = "error"; details = `Absent from ${maxAbsent}+ examinations in one semester (ENG 23c).`;
   } else if (specialCount > 0 && failCount < totalUnits / 2) {
     const parts: string[] = [];
     if (failCount > 0)    parts.push(`SUPP ${failCount}`);
@@ -383,6 +416,30 @@ export const calculateStudentStatus = async (
   };
 };
 
+/**
+ * Puts a student on stay-out: remembers the failed units (they drive ENG.22(c)/(e) when the retake
+ * is graded) and writes the audit trail. `rule` is the clause shown to the coordinator.
+ */
+const recordStayout = async (
+  student: any, statusResult: StudentStatusResult, currentYear: number, completedYear: string, fromStatus: string,
+  rule: string, details: string,
+): Promise<void> => {
+  const already = new Set((student.stayoutUnits || [])
+    .filter((u: any) => u.fromAcademicYear === completedYear).map((u: any) => u.programUnitId));
+  const entries = statusResult.failedList
+    .filter((f) => !already.has(f.programUnitId))
+    .map((f) => ({
+      programUnitId: f.programUnitId, unitCode: f.displayName.split(":")[0].trim(),
+      fromYear: currentYear, fromAcademicYear: completedYear, addedAt: new Date(), status: "pending" as const,
+    }));
+  await Student.findByIdAndUpdate(student._id, {
+    $set:  { remarks: `${rule}: ${details}` },
+    $push: {
+      statusEvents: { fromStatus, toStatus: "active", date: new Date(), academicYear: completedYear, reason: `${rule}: ${details}` },
+      ...(entries.length ? { stayoutUnits: { $each: entries } } : {}),
+    },
+  });
+};
 
 export const promoteStudent = async (studentId: string): Promise<{
   success:       boolean;
@@ -409,6 +466,11 @@ export const promoteStudent = async (studentId: string): Promise<{
   if (auditResult.discontinued)
     return { success: false, message: `Discontinued: ${auditResult.reason}` };
  
+  // ENG.16(b): four failed attempts at a unit — must repeat the unit, cannot progress.
+  const rpu = await applyRepeatUnitRule(studentId);
+  if (rpu.blocked)
+    return { success: false, message: `Promotion blocked: ${rpu.reason}` };
+  
   const program  = student.program as any;
   const duration = program.durationYears || 5;
  
@@ -482,10 +544,7 @@ export const promoteStudent = async (studentId: string): Promise<{
   }
  
   if (statusResult.status === "STAYOUT") {
-    await Student.findByIdAndUpdate(studentId, {
-      $set:  { remarks: `ENG.15h: ${statusResult.details}` },
-      $push: { statusEvents: { fromStatus: st, toStatus: "active", date: new Date(), academicYear: completedYear, reason: `ENG.15h: ${statusResult.details}` } },
-    });
+    await recordStayout(student, statusResult, currentYear, completedYear, st, "ENG.15h", statusResult.details);
     return { success: false, message: "Stay out required (ENG.15h)", details: statusResult };
   }
  
@@ -504,17 +563,36 @@ export const promoteStudent = async (studentId: string): Promise<{
  
   // Graduation path (final year)
   if (currentYear === duration) {
+
+    // ENG.15(f)(g) / ENG.24(a): every unit of the final year must be passed.
+    // A failed, missing, incomplete, special or deferred unit blocks graduation.
+    const outstanding = [
+      ...statusResult.failedList.map((u) => `${u.displayName} (failed)`),
+      ...statusResult.specialList.map((u) => `${u.displayName} (special pending)`),
+      ...statusResult.deferredList.map((u) => `${u.displayName} (deferred)`),
+      ...statusResult.missingList.map((u) => `${u} (missing)`),
+      ...statusResult.incompleteList.map((u) => `${u} (incomplete)`),
+    ];
+    if (outstanding.length > 0)
+      return {
+        success: false,
+        message: `Cannot graduate (ENG.15(f)/24(a)): ${outstanding.length} final-year unit(s) not passed: ${outstanding.join("; ")}`,
+        details: statusResult,
+      };
+
     if (pendingCF > 0)
       return { success: false, message: `Cannot graduate: ${pendingCF} carry-forward unit(s) not yet cleared` };
  
+    // ENG.24(b),(c): attachments / teaching practicum must be passed (when enforced in settings).
+    const missingAtt = await outstandingAttachments(studentId);
+    if (missingAtt.length > 0)
+      return { success: false, message: `Cannot graduate (ENG.24): ${missingAtt.join("; ")} not passed` };
+
     const fullHistory = [...((student as any).academicHistory || []), histRecord];
     const finalWAA    = fullHistory.reduce((acc: number, h: any) => acc + (h.weightedContribution || 0), 0);
  
-    let classification = "PASS";
-    if (finalWAA >= 70)      classification = "FIRST CLASS HONOURS";
-    else if (finalWAA >= 60) classification = "SECOND CLASS HONOURS (UPPER DIVISION)";
-    else if (finalWAA >= 50) classification = "SECOND CLASS HONOURS (LOWER DIVISION)";
- 
+    const classification = classifyWAA(finalWAA);
+
     await Student.findByIdAndUpdate(studentId, {
       $set:  { status: "graduand", qualifierSuffix: "", finalWeightedAverage: finalWAA.toFixed(2), classification, graduationYear: new Date().getFullYear(), currentYearOfStudy: currentYear + 1 },
       $push: { academicHistory: histRecord },
@@ -535,8 +613,17 @@ export const promoteStudent = async (studentId: string): Promise<{
     cfMessage = cfGranted
       ? `Promoted to Year ${nextYear} with carry-forward (${cfResult.qualifier}): ${cfResult.cfUnits.map((u) => u.unitCode).join(", ")}`
       : "";
-    if (!cfGranted)
+    if (!cfGranted) {
+      // ENG.15(d)/(e): more than two units still failed after the supplementaries — the student
+      // does not proceed and retakes the failed units at the next ordinary sitting.
+      if (statusResult.failedList.length > 2) {
+        const rule = ((program as any).degreeType === "BEd") ? "ENG.15(e)" : "ENG.15(d)";
+        await recordStayout(student, statusResult, currentYear, completedYear, st, rule,
+          `${statusResult.failedList.length} units failed at supplementary — retake at the next ordinary examinations`);
+        return { success: false, message: `Stay out required (${rule}): ${statusResult.failedList.length} units failed at supplementary`, details: statusResult };
+      }
       return { success: false, message: `Promotion Blocked: ${cfResult.reason}`, details: statusResult };
+    }
   }
  
   await Student.findByIdAndUpdate(studentId, {
@@ -624,10 +711,23 @@ export const previewPromotion = async (
     },
   }).lean();
 
+  // Students who were already promoted out of this year (e.g. promoted before the reports were
+  // downloaded). They must still appear on the CMS and the pass list for the year they sat.
+  const alreadyIds = new Set<string>([
+    ...admissionStudents, ...returningStudents, ...adminStudents,
+  ].map((s: any) => s._id.toString()));
+  const promotedAway = await Student.find({
+    program: programId,
+    currentYearOfStudy: nextYear,
+    status: { $nin: ["graduated", "graduand", "discontinued", "deregistered"] },
+    academicHistory: { $elemMatch: { yearOfStudy: yearToPromote, academicYear: academicYearName } },
+  }).lean();
+
   const allStudents = [
     ...admissionStudents,
     ...returningStudents,
     ...adminStudents,
+    ...promotedAway.filter((s: any) => !alreadyIds.has(s._id.toString())),
   ];
   const ADMIN_LABELS: Record<string, string> = {
     on_leave: "ACADEMIC LEAVE",
@@ -639,6 +739,46 @@ export const previewPromotion = async (
 
   const eligible: any[] = [];
   const blocked: any[] = [];
+
+  // The per-student engine runs are independent and slow (many DB reads each), so run them a few
+  // at a time up front; the loop below keeps the original order and rules.
+  const needsEngine = (st: any) => st.currentYearOfStudy !== nextYear && !ADMIN_LABELS[st.status];
+  const computed = new Map<string, { hist?: any; sr?: any }>();
+  const memo = new Map<string, Promise<any>>(); // class-wide look-ups shared by every student in this analysis
+  // Load every needed mark for the whole class in 3 queries (instead of 3 per student).
+  const engineStudents = allStudents.filter(needsEngine);
+  const classPuIds = (await ProgramUnit.find({ program: programId, requiredYear: yearToPromote }).select("_id").lean())
+    .map((pu: any) => pu._id);
+  const byStudent = (docs: any[]) => {
+    const m = new Map<string, any[]>();
+    for (const d of docs) { const k = String(d.student); (m.get(k) ?? m.set(k, []).get(k)!).push(d); }
+    return m;
+  };
+  let classMarks: { detailed: Map<string, any[]>; direct: Map<string, any[]>; grades: Map<string, any[]> } | null = null;
+  if (engineStudents.length && classPuIds.length) {
+    const q = { student: { $in: engineStudents.map((st: any) => st._id) }, programUnit: { $in: classPuIds } };
+    const [d1, d2, d3] = await Promise.all([Mark.find(q).lean(), MarkDirect.find(q).lean(), FinalGrade.find(q).lean()]);
+    classMarks = { detailed: byStudent(d1 as any[]), direct: byStudent(d2 as any[]), grades: byStudent(d3 as any[]) };
+  }
+
+  await mapLimit(engineStudents, 5, async (st: any) => {
+    const id = st._id.toString();
+    const entry: { hist?: any; sr?: any } = {};
+    if (yearToPromote === duration - 1) {
+      entry.hist = await validateHistoricalYears(id, programId, duration - 1);
+      if (!entry.hist.canEnterFinalYear) { computed.set(id, entry); return; }
+    }
+    entry.sr = await calculateStudentStatus(st._id, programId, academicYearName, yearToPromote, {
+     forPromotion: true, memo,
+      prefetched: classMarks ? {
+        student: st,
+        detailed: classMarks.detailed.get(id) ?? [],
+        direct: classMarks.direct.get(id) ?? [],
+        grades: classMarks.grades.get(id) ?? [],
+      } : undefined,
+    });
+    computed.set(id, entry);
+  });
 
   for (const student of allStudents) {
     const isAlreadyPromoted = (student as any).currentYearOfStudy === nextYear;
@@ -693,11 +833,7 @@ export const previewPromotion = async (
     // as eligible for Y5 entry. With this, the coordinator sees the specific
     // blocking units before attempting the promotion.
     if (yearToPromote === duration - 1) {
-      const histCheck = await validateHistoricalYears(
-        (student as any)._id.toString(),
-        programId,
-        duration - 1,
-      );
+      const histCheck = computed.get((student as any)._id.toString())!.hist;
 
       if (!histCheck.canEnterFinalYear) {
         blocked.push({
@@ -721,13 +857,7 @@ export const previewPromotion = async (
     }
 
     // Standard engine check (unchanged)
-    const sr = await calculateStudentStatus(
-      (student as any)._id,
-      programId,
-      academicYearName,
-      yearToPromote,
-      { forPromotion: true },
-    );
+    const sr = computed.get((student as any)._id.toString())!.sr;
 
     const specialGrounds =
       [
@@ -788,18 +918,55 @@ export const bulkPromoteClass = async (programId: string, yearToPromote: number,
   const students = await Student.find({ program: programId, currentYearOfStudy: { $in: [yearToPromote, nextYear] }, status: { $in: ["active", "repeat"] } });
   const results  = { promoted: 0, failed: 0, alreadyPromoted: 0, errors: [] as string[] };
 
-  for (const student of students) {
+  // Students are independent, so promote a few at a time (the sequential version timed out the screen).
+  await mapLimit(students, 4, async (student) => {
     const sid   = (student._id as any).toString();
     const rNo   = (student as any).regNo;
     const curYr = (student as any).currentYearOfStudy;
     try {
-      if (curYr >= nextYear) { results.alreadyPromoted++; results.promoted++; continue; }
+      if (curYr >= nextYear) { results.alreadyPromoted++; results.promoted++; return; }
       const res = await promoteStudent(sid);
       if (res.success) results.promoted++; else results.failed++;
     } catch (err: any) {
       results.errors.push(`${rNo}: ${err.message}`);
     }
-  }
+  });
 
   return results;
 };
+
+/**
+ * Runs the status engine for a whole class at once (used by the CMS download).
+ * Loads students and marks in a handful of queries and shares look-ups between students,
+ * instead of ~6 sequential queries per student. Errors are returned per student, not thrown.
+ */
+export async function auditClass(
+  studentIds: string[], programId: string, academicYearName: string, yearOfStudy: number,
+): Promise<Map<string, { audit?: any; error?: string }>> {
+  const out = new Map<string, { audit?: any; error?: string }>();
+  if (!studentIds.length) return out;
+  const students = await Student.find({ _id: { $in: studentIds } }).lean() as any[];
+  const puIds = (await ProgramUnit.find({ program: programId, requiredYear: yearOfStudy }).select("_id").lean()).map((p: any) => p._id);
+  const group = (docs: any[]) => {
+    const m = new Map<string, any[]>();
+    for (const d of docs) { const k = String(d.student); (m.get(k) ?? m.set(k, []).get(k)!).push(d); }
+    return m;
+  };
+  const q = { student: { $in: students.map((s) => s._id) }, programUnit: { $in: puIds } };
+  const [d1, d2, d3] = puIds.length
+    ? await Promise.all([Mark.find(q).lean(), MarkDirect.find(q).lean(), FinalGrade.find(q).lean()])
+    : [[], [], []];
+  const detailed = group(d1 as any[]), direct = group(d2 as any[]), grades = group(d3 as any[]);
+  const memo = new Map<string, Promise<any>>();
+  await mapLimit(students, 5, async (st: any) => {
+    const id = String(st._id);
+    try {
+      const audit = await calculateStudentStatus(st._id, programId, academicYearName, yearOfStudy, {
+        forPromotion: true, memo,
+        prefetched: { student: st, detailed: detailed.get(id) ?? [], direct: direct.get(id) ?? [], grades: grades.get(id) ?? [] },
+      });
+      out.set(id, { audit });
+    } catch (e: any) { out.set(id, { error: e?.message ?? "engine error" }); }
+  });
+  return out;
+}

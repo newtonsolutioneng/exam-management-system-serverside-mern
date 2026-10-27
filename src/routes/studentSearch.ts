@@ -1,5 +1,6 @@
 // serverside/src/routes/studentSearch.ts
 
+import { refreshStudentWAA } from "../services/graduationEngine";
 import express, { Response } from "express";
 import { splitRegNo, regNoAnyQualifierRegex } from "../utils/regNoQualifier";
 import Student from "../models/Student";
@@ -19,6 +20,7 @@ import { deferAdmission, grantAcademicLeave, readmitStudent, revertStatusToActiv
 import { getYearWeight } from "../utils/weightingRegistry";
 import { resolveStudentStatus } from "../utils/studentStatusResolver";
 import { logAudit } from "../lib/auditLogger";
+import { listAuditedUnits } from "../services/auditedUnits";
 
 const router = express.Router();
 
@@ -121,6 +123,7 @@ router.get("/record", requireAuth, asyncHandler(async (req: AuthenticatedRequest
     }
   });
 
+  const auditedUnits = await listAuditedUnits(student._id); // ENG.9: shown on the transcript, never counted
   const sortedGrades = processedGrades.sort((a, b) => String(a.semester || "").localeCompare(String(b.semester || "")));
   const LOCKED = ["on_leave","deferred","discontinued","deregistered","graduated","graduand"];
 
@@ -130,13 +133,14 @@ router.get("/record", requireAuth, asyncHandler(async (req: AuthenticatedRequest
     return res.json({
       student: { _id: student._id, name: student.name, regNo: student.regNo, programId: (student.program as any)?._id, currentYear: student.currentYearOfStudy, programName: (student.program as any)?.name, status: student.status },
       grades: sortedGrades,
+      auditedUnits,
       academicStatus: { status: resolved.status, variant: vm[student.status] ?? "info", details: resolved.reason || `Student is currently ${resolved.status}.`, weightedMean: "0.00", summary: { totalExpected: 0, passed: 0, failed: 0, missing: 0, isOnLeave: true }, passedList: [], failedList: [], specialList: [], missingList: [], incompleteList: [], academicYearName: "" },
     });
   }
 
   const academicStatus = await calculateStudentStatus(student._id, (student.program as any)._id, "", targetYearOfStudy);
-  res.json({ student: { _id: student._id, name: student.name, regNo: student.regNo, programId: (student.program as any)?._id, currentYear: student.currentYearOfStudy, programName: (student.program as any)?.name, status: student.status }, grades: sortedGrades, academicStatus });
-}));
+  res.json({ student: { _id: student._id, name: student.name, regNo: student.regNo, programId: (student.program as any)?._id, currentYear: student.currentYearOfStudy, programName: (student.program as any)?.name, status: student.status }, grades: sortedGrades, auditedUnits, academicStatus });
+ }));
 
 const formatChallenges = (analysis: any) => ({
   supplementary: analysis.failedList.filter((f: any) => f.attempt === "A/S").map((f: any) => f.displayName.split(":")[0]),
@@ -982,11 +986,29 @@ router.get("/journey", requireAuth,
 );
 
 router.post("/approve-special", requireAuth, requireRole("coordinator"), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const { markId, reason, undo = false } = req.body;
-  if (!markId) return res.status(400).json({ error: "Mark ID is required" });
+  const { markId, reason, undo = false, knownToDean, otherGroundApproved } = req.body;
+  let { ground } = req.body as { ground?: string };
+   if (!markId) return res.status(400).json({ error: "Mark ID is required" });
+
+  let remarks = "Special Exam Revoked";
+  if (!undo) {
+    // ENG.18(b): the three grounds are sickness, compassionate and financial, unless otherwise specified and approved.
+    if (!ground && typeof reason === "string") ground = reason.trim().toLowerCase(); // older clients send the ground as `reason`
+    const GROUNDS = ["sickness", "compassionate", "financial"];
+    if (!ground || ![...GROUNDS, "other"].includes(ground))
+      return res.status(400).json({ error: "ENG.18(b): the ground must be sickness, compassionate or financial." });
+    if (ground === "other" && otherGroundApproved !== true)
+      return res.status(400).json({ error: "ENG.18(b): any other ground needs explicit approval (otherGroundApproved)." });
+    // ENG.18(d): the good cause must have been known to the Dean while the work or exam was being conducted.
+    if (knownToDean !== true)
+      return res.status(400).json({ error: "ENG.18(d): confirm that the good cause was made known to the Dean during the period of the assessment." });
+    const detail = ground === "other" && reason ? ` — ${reason}` : "";
+    remarks = `Special Granted: ${ground.charAt(0).toUpperCase()}${ground.slice(1)}${detail}`;
+  }
+
   const upd = undo
-    ? { $set: { isSpecial: false, attempt: "1st", remarks: "Special Exam Revoked" } }
-    : { $set: { isSpecial: true, attempt: "special", remarks: `Special Granted: ${reason || "Administrative"}` } };
+    ? { $set: { isSpecial: false, attempt: "1st", remarks } }
+    : { $set: { isSpecial: true, attempt: "special", remarks } };
   let mark = await Mark.findByIdAndUpdate(markId, upd, { new: true });
   if (!mark) mark = await MarkDirect.findByIdAndUpdate(markId, upd, { new: true });
   if (!mark) return res.status(404).json({ error: "Mark record not found" });
@@ -1015,9 +1037,9 @@ router.post("/revert-active", requireAuth, requireRole("coordinator"), asyncHand
 }));
 
 router.post("/readmit", requireAuth, requireRole("coordinator"), asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
-  const { studentId, remarks } = req.body;
+  const { studentId, remarks, secondSemester } = req.body;
   if (!studentId) return res.status(400).json({ error: "Student ID required" });
-  const result = await readmitStudent(studentId, remarks || "Approved by Senate/Department");
+  const result = await readmitStudent(studentId, remarks || "Approved by Senate/Department", secondSemester === true);
   console.log(`[READMISSION] ${result?.regNo} reinstated by ${req.user?.name}`);
   res.json({ success: true, message: "Student readmitted successfully", student: result });
 }));
@@ -1045,11 +1067,15 @@ router.post("/raw-marks", requireAuth, requireRole("coordinator"), asyncHandler(
   if (isDirectEntry) {
     const upd = { institution: student.institution, student: student._id, programUnit: programUnit._id, academicYear: yearDoc._id, semester: semester || "SEMESTER 1", caTotal30: Number(caDirect)||0, examTotal70: Number(examDirect)||0, agreedMark: Number(agreedMark)||(Number(caDirect)+Number(examDirect)), attempt: isSpecial ? "special" : (attempt||"1st"), isSpecial: isSpecial===true, uploadedBy: req.user._id, uploadedAt: new Date() };
     const u = await MarkDirect.findOneAndUpdate({ student: student._id, programUnit: programUnit._id, academicYear: yearDoc._id }, upd, { upsert: true, new: true, setDefaultsOnInsert: true });
-    return res.json({ success: true, message: "Direct mark saved", data: u });
+    // Re-grade so the official grade, transcript and status reflect the edit (the detailed branch already did).
+    const gr = await computeFinalGrade({ markId: u._id as any, coordinatorReq: req });
+    await refreshStudentWAA(student._id).catch((e: unknown) => console.warn("[raw-marks] WAA refresh failed:", e instanceof Error ? e.message : e));
+    return res.json({ success: true, message: "Direct mark saved and re-graded", data: gr ?? u });
   }
   const upd = { institution: student.institution, student: student._id, programUnit: programUnit._id, academicYear: yearDoc._id, semester: semester||"SEMESTER 1", cat1Raw: Number(cat1)||0, cat2Raw: Number(cat2)||0, cat3Raw: cat3?Number(cat3):undefined, assgnt1Raw: Number(assignment1)||0, practicalRaw: Number(practicalRaw)||0, examQ1Raw: Number(examQ1)||0, examQ2Raw: Number(examQ2)||0, examQ3Raw: Number(examQ3)||0, examQ4Raw: Number(examQ4)||0, examQ5Raw: Number(examQ5)||0, examMode: examMode||"standard", isSpecial: isSpecial===true, attempt: isSpecial?"special":(attempt||"1st"), uploadedBy: req.user._id, uploadedAt: new Date() };
   const u = await Mark.findOneAndUpdate({ student: student._id, programUnit: programUnit._id, academicYear: yearDoc._id }, upd, { upsert: true, new: true, setDefaultsOnInsert: true });
   const gr = await computeFinalGrade({ markId: u._id as any, coordinatorReq: req });
+  await refreshStudentWAA(student._id).catch((e: unknown) => console.warn("[raw-marks] WAA refresh failed:", e instanceof Error ? e.message : e));
   return res.json({ success: true, message: "Detailed marks processed", data: gr });
 }));
 

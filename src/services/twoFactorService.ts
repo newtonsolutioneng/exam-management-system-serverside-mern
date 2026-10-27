@@ -109,7 +109,7 @@
 // serverside/src/services/twoFactorService.ts
 import nodemailer from "nodemailer";
 import config from "../config/config";
-import path from "path";
+import { getEmailLogo } from "../config/emailLogo";
 
 const getTransporter = () =>
   nodemailer.createTransport({
@@ -120,7 +120,6 @@ const getTransporter = () =>
   });
 
 // Path to your logo
-const logoPath = path.join(process.cwd(), "public", "acadedesk.png");
 
 export const sendOTPEmail = async (
   email: string,
@@ -140,12 +139,8 @@ export const sendOTPEmail = async (
     from: `"${fromName}" <${config.emailUser}>`,
     to: email,
     subject,
-    // Attach the logo for the header
-    attachments: [{
-      filename: 'acadedesk.png',
-      path: logoPath,
-      cid: 'applogo'
-    }],
+    // The logo is referenced by URL; it is attached inline only in local development.
+    attachments: getEmailLogo().attachments,
     html: `
 <!DOCTYPE html>
 <html lang="en">
@@ -174,7 +169,7 @@ export const sendOTPEmail = async (
                     ${fromName}
                   </td>
                   <td align="right">
-                    <img src="cid:applogo" alt="Logo" width="36" height="36" 
+                  <img src="${getEmailLogo().src}" alt="Logo" width="36" height="36"  
                          style="display:block;border-radius:6px;object-fit:contain;" />
                   </td>
                 </tr>
