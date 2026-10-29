@@ -1,4 +1,5 @@
 // serverside/src/routes/promote.ts
+import { suppCohortFromMarks, inSuppCohort } from "../utils/suppScope";
 import { lapTimer } from "../utils/perfLog";
 import { Router, Response } from "express";
 import { requireAuth, requireRole } from "../middleware/auth";
@@ -134,14 +135,21 @@ router.post( "/download-report-progress", requireAuth, asyncHandler(async (req: 
       const offeredUnitsRaw = await ProgramUnit.find({ program: programId, requiredYear: yearToPromote }).populate("unit").lean();
       const offeredUnits = offeredUnitsRaw.map((pu: any) => ({ code: pu.unit?.code || "N/A", name: pu.unit?.name || "N/A" }));
 
+      // In the supplementary & special session the documents cover only the candidates that session is about
+      // (those who sat, or are still owed, a supplementary/special). Send reportScope: "all" for the whole class.
+      const suppOnly = sessionExamType === "SUPPLEMENTARY" && req.body.reportScope !== "all";
+      const markCohort = suppCohortFromMarks(filteredMarks);
+      const inScope = (s: any) => !suppOnly || inSuppCohort(s, markCohort);
+
       // 5. Prepare Data Objects (Separated for type safety)
       const wordData: PromotionData = {
         programName: program?.name || "Program",
         academicYear: academicYearName,
         yearOfStudy: yearToPromote,
         totalYears: (program as any)?.durationYears,
-        eligible: preview.eligible,
-        blocked: preview.blocked,
+        degreeType: (program as any)?.degreeType,
+        eligible: preview.eligible.filter(inScope),
+        blocked: preview.blocked.filter(inScope),
         offeredUnits,
         logoBuffer,
         examType: sessionExamType,
@@ -167,7 +175,7 @@ router.post( "/download-report-progress", requireAuth, asyncHandler(async (req: 
       const previewIds = new Set([...preview.eligible, ...preview.blocked].map((s) => (s.id || s._id)?.toString()));
       const historyOnly = studentsByHistory.filter((s) => !previewIds.has(s._id.toString()));
 
-      const allCmsStudents = [ ...preview.eligible, ...preview.blocked, ...historyOnly ];
+      const allCmsStudents = [ ...preview.eligible, ...preview.blocked, ...historyOnly ].filter(inScope);
 
       const excelData: ConsolidatedData = {
         programName: program?.name || "Program", academicYear: academicYearName, yearOfStudy: yearToPromote,
@@ -317,7 +325,7 @@ await addDocIfNotEmpty(suppLeave, getFileName("Supplementary_After_Academic_Leav
       await addDocIfNotEmpty( defermentList, getFileName("Deferment_List"), generateDefermentDoc );
 
       sendProgress(90, "Checking Carry Forward List...");
-      const carryList = wordData.eligible.filter(s => s.reasons?.length > 0 && s.status !== "ALREADY PROMOTED");
+      const carryList = wordData.eligible.filter(s => s.carryForward && s.status !== "ALREADY PROMOTED");
       await addDocIfNotEmpty(carryList, getFileName("Carry_Forward_List"), generateCarryForwardDoc);
 
       // 7. Zip and Send
@@ -378,20 +386,20 @@ router.post(
       const targetAcadYearId = (academicYearDoc as any)?._id?.toString();
 
       // Results waiting on the coordinator's action list must be dealt with (or knowingly skipped
-            // with force=true) before a CMS is generated from incomplete data.
-            if (targetAcadYearId && !req.body.force) {
-              const openProblems = await ProblemResult.countDocuments({
-                institution: req.user.institution, status: "OPEN", academicYear: targetAcadYearId,
-              });
-              if (openProblems > 0) {
-                res.write(`data: ${JSON.stringify({
-                  error: `${openProblems} uploaded result(s) still need action (Upload Results → Action list).`,
-                  code: "OPEN_PROBLEM_RESULTS", count: openProblems,
-                })}\n\n`);
-                res.end();
-                return;
-              }
-            }
+      // with force=true) before a CMS is generated from incomplete data.
+      if (targetAcadYearId && !req.body.force) {
+        const openProblems = await ProblemResult.countDocuments({
+          institution: req.user.institution, status: "OPEN", academicYear: targetAcadYearId,
+        });
+        if (openProblems > 0) {
+          res.write(`data: ${JSON.stringify({
+            error: `${openProblems} uploaded result(s) still need action (Upload Results → Action list).`,
+            code: "OPEN_PROBLEM_RESULTS", count: openProblems,
+          })}\n\n`);
+          res.end();
+          return;
+        }
+      }
 
       const sessionExamType: "ORDINARY" | "SUPPLEMENTARY" =
         (academicYearDoc as any)?.session === "SUPPLEMENTARY"
@@ -461,7 +469,7 @@ router.post(
             populate: { path: "unit", select: "code name" },
           })
           .lean(),
-          MarkDirect.find({ student: { $in: studentIds }, programUnit: { $in: yearPuIds } })
+        MarkDirect.find({ student: { $in: studentIds }, programUnit: { $in: yearPuIds } })
           .populate({
             path: "programUnit",
             populate: { path: "unit", select: "code name" },
@@ -500,12 +508,16 @@ router.post(
 
       sendProgress(70, "Generating Consolidated Mark Sheet...");
 
+      // Supplementary & special session: list only the candidates that session is about (reportScope: "all" for everyone).
+      const suppOnly = sessionExamType === "SUPPLEMENTARY" && req.body.reportScope !== "all";
+      const markCohort = suppCohortFromMarks(filteredMarks);
+
       const excelData: ConsolidatedData = {
         programName: (program as any)?.name || "Program",
         academicYear: academicYearName,
         yearOfStudy: yearToPromote,
         session: sessionExamType,
-        students: allStudents,
+        students: suppOnly ? allStudents.filter((s: any) => inSuppCohort(s, markCohort)) : allStudents,
         marks: filteredMarks,
         offeredUnits,
         logoBuffer,

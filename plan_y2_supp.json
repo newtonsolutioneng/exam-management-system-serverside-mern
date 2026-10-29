@@ -1,0 +1,8 @@
+{
+  "_comment": "Cohort B, Year 2, supplementary & special session. 2010 and 2011 do NOT sit (their rows are cleared) so they can defer. 2014 fails the supplementary and so goes to carry-forward. Everyone else on the sheets passes.",
+  "skip": {
+    "E024-01-2010/2018": ["TST 2101"],
+    "E024-01-2011/2018": ["TST 2102"]
+  },
+  "suppFail": { "E024-01-2014/2018": ["TST 2105"] }
+}

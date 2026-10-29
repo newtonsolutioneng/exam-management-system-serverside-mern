@@ -16,6 +16,16 @@ import { cleanRegNo } from "../utils/regNoQualifier";
 
 export type { ImportResult };
 
+/**
+ * A row holds a result when it has a registration number. The S/N column is NOT required: a coordinator
+ * who types an extra student into a spare row under the class list does not number it. Header text is ignored.
+ */
+export function isDataRow(r: unknown[]): boolean {
+  const text = String(r[1] ?? "").trim().toUpperCase();
+  if (!text || text === "REG. NO." || text === "REG NO") return false;
+  return !!cleanRegNo(text);
+}
+
 export async function importMarksFromBuffer(
   buffer: Buffer,
   filename: string,
@@ -56,7 +66,7 @@ export async function importMarksFromBuffer(
       const rows: Array<{ row: unknown[]; rowNum: number }> = [];
       rawRows.forEach((row, index) => {
         const r = row as unknown[];
-        if (!cleanRegNo(r[1]) || r[0] === "" || r[0] === undefined) return;
+        if (!isDataRow(r)) return;
         rows.push({ row: r, rowNum: index + 17 });
       });
     

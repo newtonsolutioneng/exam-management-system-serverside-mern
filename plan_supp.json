@@ -1,0 +1,4 @@
+{
+  "_comment": "Supplementary and special session. Everyone passes except student 2004 who fails one supplementary (TST 1206) and so goes to carry-forward.",
+  "suppFail": { "E024-01-2004/2018": ["TST 1206"] }
+}

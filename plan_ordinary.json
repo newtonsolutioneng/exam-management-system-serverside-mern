@@ -1,0 +1,35 @@
+{
+  "_comment": "Ordinary session. Units: TST 1101-1104 (semester 1), TST 1205-1207 (semester 2). Change the unit codes if yours differ (see cell H12 of a downloaded sheet).",
+  "ordinaryFail": {
+    "E024-01-2001/2018": ["TST 1101"],
+    "E024-01-2002/2018": ["TST 1103"],
+    "E024-01-2003/2018": ["TST 1101", "TST 1205"],
+    "E024-01-2004/2018": ["TST 1104", "TST 1206"],
+    "E024-01-2005/2018": ["TST 1101", "TST 1102", "TST 1103"],
+    "E024-01-2006/2018": ["TST 1101", "TST 1102", "TST 1103", "TST 1104"],
+    "E024-01-2007/2018": [
+      "TST 1101",
+      "TST 1102",
+      "TST 1103",
+      "TST 1104",
+      "TST 1205"
+    ]
+  },
+  "absent": {
+    "E024-01-2008/2018": ["TST 1102", "TST 1206"]
+  },
+  "extras": [
+    { "regNo": "E024-01-2033/2018", "name": "Cohort C Late Student 01" },
+    {
+      "regNo": "E024-01-2034/2018",
+      "name": "Cohort C Late Student 02",
+      "regNoTyped": { "TST 1101": "E024-01-2043/2018" }
+    },
+    { "regNo": "E024-01-9001/2018", "name": "Cohort C Never Registered 01" },
+    {
+      "regNo": "E024-D-01-1337/2013",
+      "name": "Test Student 01 (BEd)",
+      "units": ["TST 1101", "TST 1102"]
+    }
+  ]
+}

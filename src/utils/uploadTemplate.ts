@@ -30,7 +30,7 @@ export const generateFullScoresheetTemplate = async (
   unitType:       "theory" | "lab" | "workshop" = "theory",
   distribution:   MarkDistribution | null = null,   // CA/exam split; null = unit default → 30/70 (workshop 40/60)
   extraRegNos:    string[] = [],                    // students outside the main class to add to the sheet
- ): Promise<Buffer> => {
+): Promise<Buffer> => {
 
   // ── Metadata ──────────────────────────────────────────────────────────────
   const [program, unit, academicYear] = await Promise.all([
@@ -86,7 +86,7 @@ export const generateFullScoresheetTemplate = async (
   const dist    = resolveDistribution(distribution, unit?.markDistribution, unitType);
   const weights = unitWeights(unitType, dist);
   const caWeightTotal = dist.ca;
-   const rawPaperMax   = 70;
+  const rawPaperMax   = 70;
 
   // ── Column headers ────────────────────────────────────────────────────────
   const headers = ["S/N", "REG. NO.", "NAME", "ATTEMPT", "CAT 1", "CAT 2", "CAT 3", "AVG CAT", "ASSGNT 1", "ASSGNT 2", "ASSGNT 3", "AVG ASSGNT", "PRACTICAL", `CA TOTAL (${caWeightTotal}%)`, `Q1 (/${q1Max})`, "Q2", "Q3", "Q4", "Q5", `EXAM (${weights.exam}%)`, "INTERNAL (/100)", "EXTERNAL (/100)", "AGREED (/100)", "GRADE"];
@@ -243,7 +243,7 @@ export const generateFullScoresheetTemplate = async (
 
       // ── Pre-populate special CA (ENG.18c) ─────────────────────────────
       
-      if ((ss.isSpecial || ss.isCarriedSpecial) && prevMark) {
+      if ((ss.isSpecial || ss.isCarriedSpecial || ss.lockCA) && (ss.lockCA ? ss.prevMark : prevMark)) {
         // For isCarriedSpecial: prevMark is already set on ss.prevMark by
         // scoresheetStudentList_v3 — it is the FinalGrade/Mark from the prior year.
         // For detailed templates: raw CA scores live on the Mark document.
@@ -255,6 +255,8 @@ export const generateFullScoresheetTemplate = async (
         const cat2    = caSource.cat2Raw    ?? 0;
         const cat3    = caSource.cat3Raw    ?? 0;
         const assgnt1 = caSource.assgnt1Raw ?? 0;
+        const assgnt2 = caSource.assgnt2Raw ?? 0;
+        const assgnt3 = caSource.assgnt3Raw ?? 0;
         const prac    = caSource.practicalRaw ?? 0;
        
         // Only pre-populate if there is actually CA data
@@ -263,6 +265,8 @@ export const generateFullScoresheetTemplate = async (
           row.getCell(6).value  = cat2;
           row.getCell(7).value  = cat3;
           row.getCell(9).value  = assgnt1;
+          row.getCell(10).value = assgnt2;
+          row.getCell(11).value = assgnt3;
           row.getCell(13).value = prac;
           for (let c = 5; c <= 13; c++) {
             row.getCell(c).fill       = greyFill;
@@ -346,7 +350,7 @@ export const generateFullScoresheetTemplate = async (
       } else if (isFormulaCol) {
         cell.fill       = greyFill;
         cell.protection = { locked: true };
-      } else if (ss && (isSpecial || ss.isCarriedSpecial) && (isCAInput || isPracInput)) {
+      } else if (ss && (isSpecial || ss.isCarriedSpecial || ss.lockCA) && (isCAInput || isPracInput)) {
         // Special: CA locked to pre-existing value
         cell.fill       = greyFill;
         cell.protection = { locked: true };
@@ -422,6 +426,7 @@ export const generateFullScoresheetTemplate = async (
   const buf = await workbook.xlsx.writeBuffer();
   return Buffer.from(buf as ArrayBuffer);
 };
+
 
 
 

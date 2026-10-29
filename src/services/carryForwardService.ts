@@ -74,7 +74,8 @@ export const assessAndGrantCarryForward = async (
     if ((m as any).isSpecial || (m as any).attempt === "special") continue;
 
     const mark  = (m as any).agreedMark ?? 0;
-    const hasCA = ((m as any).caTotal30 ?? 0) > 0;
+    // A supplementary mark carries no coursework by design (ENG.13f); only a first-sitting row can lack CA.
+    const hasCA = ((m as any).caTotal30 ?? 0) > 0 || (m as any).attempt === "supplementary";
 
     if (mark < passMark || ((settings as any)?.ruleSet?.enforcePracticalPass === true && (m as any).practicalFailed === true)) {
       const code = (pu as any).unit?.code || "N/A";

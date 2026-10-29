@@ -6,7 +6,7 @@
 
 import Student from "../models/Student";
 import ProblemResult, { ProblemCode } from "../models/ProblemResult";
-import { processResultRow, loadProgramUnitMap, RowContext, RowOutcome } from "./resultRows";
+import { processResultRow, loadProgramUnitMap, rowHasNoEntries, RowContext, RowOutcome } from "./resultRows";
 import { splitRegNo } from "../utils/regNoQualifier";
 
 export interface ProblemItem {
@@ -34,25 +34,25 @@ const CAP = 100;
 
 export async function applyRows(
   ctx: RowContext,
-  rows: Array<{ row: unknown[]; rowNum: number }>,
+  allRows: Array<{ row: unknown[]; rowNum: number }>,
   meta: { filename: string; academicYearLabel: string },
 ): Promise<ImportResult> {
   const result = emptyResult();
+  ctx.academicYearLabel = ctx.academicYearLabel ?? meta.academicYearLabel;
+  // Rows with nothing typed are left alone: an empty sheet must never overwrite saved marks with zeros.
+  const rows = allRows.filter(({ row }) => !rowHasNoEntries(Array.from(row, (v) => v ?? ""), ctx.templateType));
+  const blankRows = allRows.length - rows.length;
+  if (blankRows > 0) {
+    result.warnings.push(`${blankRows} row(s) had no marks entered and were skipped — existing marks for them were not changed.`);
+  }
   const programUnits = await loadProgramUnitMap(ctx.institutionId);
   const okRegNos: string[] = [];
 
   // one query for the whole sheet instead of one per row
-  const bases = [
-    ...new Set(rows.map(({ row }) => splitRegNo(row[1]).base).filter(Boolean)),
-  ];
+  const bases = [...new Set(rows.map(({ row }) => splitRegNo(row[1]).base).filter(Boolean))];
   if (bases.length) {
-    const found = await Student.find({
-      institution: ctx.institutionId,
-      regNo: { $in: bases },
-    }).lean();
-    ctx.students = new Map(
-      (found as any[]).map((st) => [String(st.regNo), st]),
-    );
+    const found = await Student.find({ institution: ctx.institutionId, regNo: { $in: bases } }).lean();
+    ctx.students = new Map((found as any[]).map((st) => [String(st.regNo), st]));
   }
 
   // Rows are applied a few at a time (different students are independent), then folded into the
@@ -63,23 +63,16 @@ export async function applyRows(
   let inCurrent = new Set<string>();
   for (const item of rows) {
     const key = splitRegNo(item.row[1]).base;
-    if (inCurrent.has(key) || current.length >= CONCURRENCY) {
-      batches.push(current);
-      current = [];
-      inCurrent = new Set();
-    }
-    current.push(item);
-    inCurrent.add(key);
+    if (inCurrent.has(key) || current.length >= CONCURRENCY) { batches.push(current); current = []; inCurrent = new Set(); }
+    current.push(item); inCurrent.add(key);
   }
   if (current.length) batches.push(current);
 
   for (const batch of batches) {
-    const outcomes = await Promise.all(
-      batch.map(({ row }) => {
-        const sparse = Array.from(row, (v) => v ?? "");
-        return processResultRow(ctx, programUnits, sparse);
-      }),
-    );
+    const outcomes = await Promise.all(batch.map(({ row }) => {
+      const sparse = Array.from(row, (v) => v ?? "");
+      return processResultRow(ctx, programUnits, sparse);
+    }));
     for (let i = 0; i < batch.length; i++) {
       const { row, rowNum } = batch[i];
       const outcome: RowOutcome = outcomes[i];
@@ -92,12 +85,7 @@ export async function applyRows(
         else {
           result.updated++;
           if (result.replaced.length < CAP) {
-            result.replaced.push({
-              regNo: outcome.regNo,
-              unitCode: ctx.unitCode,
-              previous: outcome.previousMark ?? 0,
-              next: outcome.newMark ?? 0,
-            });
+            result.replaced.push({ regNo: outcome.regNo, unitCode: ctx.unitCode, previous: outcome.previousMark ?? 0, next: outcome.newMark ?? 0 });
           }
         }
         continue;
@@ -105,43 +93,18 @@ export async function applyRows(
 
       result.problems++;
       if (result.problemItems.length < CAP) {
-        result.problemItems.push({
-          rowNum,
-          regNo: outcome.regNo,
-          code: outcome.code,
-          message: outcome.message,
-          action: outcome.action,
-        });
+        result.problemItems.push({ rowNum, regNo: outcome.regNo, code: outcome.code, message: outcome.message, action: outcome.action });
       }
       const rawRegNo = String(sparse[1] ?? "").trim();
       await ProblemResult.findOneAndUpdate(
-        {
-          institution: ctx.institutionId,
-          status: "OPEN",
-          unitCode: ctx.unitCode,
-          academicYear: ctx.academicYearId,
-          regNo: outcome.regNo,
-        },
+        { institution: ctx.institutionId, status: "OPEN", unitCode: ctx.unitCode, academicYear: ctx.academicYearId, regNo: outcome.regNo },
         {
           $set: {
-            uploadedBy: ctx.userId,
-            batchId: ctx.batchId,
-            filename: meta.filename,
-            templateType: ctx.templateType,
-            academicYearLabel: meta.academicYearLabel,
-            rowNumber: rowNum,
-            rawRegNo,
-            studentName: String(sparse[2] ?? "").trim(),
-            program: outcome.programId,
-            code: outcome.code,
-            message: outcome.message,
-            action: outcome.action,
-            payload: {
-              row: sparse,
-              distribution: ctx.distribution,
-              unitType: ctx.unitType,
-              examMode: ctx.examMode,
-            },
+            uploadedBy: ctx.userId, batchId: ctx.batchId, filename: meta.filename, templateType: ctx.templateType,
+            academicYearLabel: meta.academicYearLabel, rowNumber: rowNum, rawRegNo,
+            studentName: String(sparse[2] ?? "").trim(), program: outcome.programId,
+            code: outcome.code, message: outcome.message, action: outcome.action,
+            payload: { row: sparse, distribution: ctx.distribution, unitType: ctx.unitType, examMode: ctx.examMode },
           },
         },
         { upsert: true },
@@ -152,21 +115,8 @@ export async function applyRows(
   // earlier problems for rows that have now gone through are done
   if (okRegNos.length) {
     await ProblemResult.updateMany(
-      {
-        institution: ctx.institutionId,
-        status: "OPEN",
-        unitCode: ctx.unitCode,
-        academicYear: ctx.academicYearId,
-        regNo: { $in: okRegNos },
-      },
-      {
-        $set: {
-          status: "RESOLVED",
-          resolvedAt: new Date(),
-          resolvedBy: ctx.userId,
-          resolution: "Uploaded successfully",
-        },
-      },
+      { institution: ctx.institutionId, status: "OPEN", unitCode: ctx.unitCode, academicYear: ctx.academicYearId, regNo: { $in: okRegNos } },
+      { $set: { status: "RESOLVED", resolvedAt: new Date(), resolvedBy: ctx.userId, resolution: "Uploaded successfully" } },
     );
   }
 
@@ -176,9 +126,7 @@ export async function applyRows(
     );
   }
   if (result.problems > 0) {
-    result.warnings.push(
-      `${result.problems} row(s) could not be applied and were added to the action list.`,
-    );
+    result.warnings.push(`${result.problems} row(s) could not be applied and were added to the action list.`);
   }
   return result;
 }

@@ -22,6 +22,8 @@ export interface RowContext {
   unitCode: string;
   academicYearId: any;
   distribution: MarkDistribution;
+  /** e.g. "2018/2019" — lets the row check deferrals made from this academic year */
+  academicYearLabel?: string;
   unitType: UnitKind;
   examMode: ExamModeKind;
   /** students of this sheet, loaded in one query (base reg no -> lean student); falls back to a per-row query */
@@ -82,6 +84,22 @@ const COL = {
   direct: { reg: 1, attempt: 3, ca: 4, exam: 5, internal: 6, external: 7, agreed: 8 },
 } as const;
 
+/**
+ * True when the typed input cells of a sheet row hold nothing to apply, so uploading an EMPTY copy of a sheet
+ * (reg numbers filled in by the template, no marks typed) can never overwrite marks that are already saved.
+ * Formula cells are ignored (an unopened-then-saved sheet shows 0 in them). Rows of a later sitting
+ * (supp / special / retake) whose only content is the locked, pre-filled coursework count as empty too.
+ */
+export function rowHasNoEntries(row: unknown[], templateType: "detailed" | "direct"): boolean {
+  const anyIn = (idx: number[]) => idx.some((i) => !blank(row[i]));
+  const examSide = templateType === "detailed" ? [14, 15, 16, 17, 18, 21] : [5, 7];
+  const caSide   = templateType === "detailed" ? [4, 5, 6, 8, 9, 10, 12] : [4];
+  if (anyIn(examSide)) return false;
+  if (!anyIn(caSide)) return true;
+  const attempt = templateType === "detailed" ? attemptFromDetailed(row[3]) : attemptFromDirect(row[3]);
+  return attempt !== "1st";
+}
+
 export async function processResultRow(
   ctx: RowContext,
   programUnits: ProgramUnitMap,
@@ -98,6 +116,15 @@ export async function processResultRow(
   const programUnit = programUnits.get(`${programId}_${unit}`);
   if (!programUnit) {
     return fail("UNIT_NOT_LINKED", regNo, `Unit ${unit} is not linked to ${regNo}'s programme curriculum.`, unit, programId);
+  }
+
+  // ENG.13b / ENG.18c: a unit deferred to the next ordinary cannot be sat in this academic year's supplementary
+  const sitAttempt = String(cell(row, 3) ?? "").toLowerCase();
+  if (ctx.academicYearLabel && (/supp|special|a\/s|spec/.test(sitAttempt))) {
+    const deferred = ((student as any).deferredSuppUnits ?? []).find((d: any) =>
+      d.status === "pending" && d.programUnitId === String((programUnit as any)._id) && d.fromAcademicYear === ctx.academicYearLabel);
+    if (deferred) return fail("INVALID_MARK", regNo,
+      `${unit} was deferred to the next ordinary period (ENG.13b/18c) — it cannot be sat in this supplementary. Cancel the deferral first if the student is sitting it now.`, unit, programId);
   }
 
   const dist = ctx.distribution;
@@ -194,3 +221,4 @@ export async function processResultRow(
     return fail("SAVE_FAILED", regNo, e?.message ?? String(err), unit, programId);
   }
 }
+

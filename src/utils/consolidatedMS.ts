@@ -5,7 +5,7 @@ import * as ExcelJS     from "exceljs";
 import config           from "../config/config";
 import { loadInstitutionSettings } from "./loadInstitutionSettings";
 import { resolveStudentStatus }    from "./studentStatusResolver";
-import { calculateStudentStatus, auditClass } from "../services/statusEngine";
+import { calculateStudentStatus, auditClass }  from "../services/statusEngine";
 import { buildDisplayRegNo }       from "./academicRules";
 import mongoose                    from "mongoose";
 import { buildRichRegNoCMS }       from "./scoresheetStudentList";
@@ -208,6 +208,32 @@ function buildAttemptNotation(
   return "B/S";
 }
 
+// ── Summary table: one label for each RECOMM. cell ─────────────────────────────
+// Every recommendation the sheet can print must land in a row of the SUMMARY, otherwise the counts stop
+// adding up to the number of students (STAYOUT used to be dropped because the text was "STAYOUT", not "STAY OUT").
+export const SUMMARY_LABELS = [
+  "PASS", "CARRY FORWARD", "SUPPLEMENTARY", "SPECIAL", "REPEAT YEAR", "STAY OUT", "INCOMPLETE",
+  "ACADEMIC LEAVE", "DEFERMENT", "DEREGISTERED/DISC", "DISCIPLINARY SUSPENSION", "GRADUATED", "OTHER",
+] as const;
+export type SummaryLabel = (typeof SUMMARY_LABELS)[number];
+
+export function classifyRecommendation(raw: string): SummaryLabel {
+  const txt = (raw || "").toUpperCase().trim();
+  if (txt === "PASS")                              return "PASS";
+  if (txt.includes("CARRY FORWARD"))               return "CARRY FORWARD";
+  if (txt.includes("DISCIPLINARY"))                return "DISCIPLINARY SUSPENSION";
+  if (txt.includes("REPEAT"))                      return "REPEAT YEAR";
+  if (/STAY\s*OUT/.test(txt))                      return "STAY OUT";
+  if (txt.includes("SUPP"))                        return "SUPPLEMENTARY";
+  if (txt.includes("SPEC"))                        return "SPECIAL";
+  if (txt.includes("ACADEMIC LEAVE") || txt === "ON LEAVE") return "ACADEMIC LEAVE";
+  if (txt.includes("DEFER"))                       return "DEFERMENT";
+  if (txt.startsWith("INC"))                       return "INCOMPLETE";
+  if (txt.includes("DEREG") || txt.includes("DISCONTINUED")) return "DEREGISTERED/DISC";
+  if (txt.includes("GRADUATED"))                   return "GRADUATED";
+  return "OTHER";
+}
+
 // ── CHANGE 2: ADMIN_STATUS_MAP now includes disciplinary_suspension ────────────
 const ADMIN_STATUS_MAP: Record<string, string> = {
   on_leave:                  "ACADEMIC LEAVE",
@@ -324,8 +350,8 @@ export const generateConsolidatedMarkSheet = async (
   // setCenteredHeader(5, `${config.schoolName || "SCHOOL OF ENGINEERING"}`);
   // setCenteredHeader(6, `${programName}`);
   setCenteredHeader(4, meta.universityName);
-  setCenteredHeader(5, meta.schoolName);
-  setCenteredHeader(6, programName);
+setCenteredHeader(5, meta.schoolName);
+setCenteredHeader(6, programName);
   setCenteredHeader(
     7,
     `CONSOLIDATED MARK SHEET - - ${examPhaseLabel} - ${yrTxt} YEAR - ${academicYear} ACADEMIC YEAR`,
@@ -449,6 +475,8 @@ export const generateConsolidatedMarkSheet = async (
 
     let audit: Record<string, any>;
 
+    if (isDisciplinary) console.log(`[CMS] ${(student as any).regNo}: student record status is "${studentStatusRaw}" (printed as DISCIPLINARY SUSPENSION)`);
+
     if (typeof adminStatusLabel === "string" && adminStatusLabel.length > 0) {
       // CHANGE 2: disciplinary suspension uses the same admin gate path as
       // DEREGISTERED — marks are blank, recommendation shows status text.
@@ -549,6 +577,8 @@ export const generateConsolidatedMarkSheet = async (
       if ((audit.specialList as any[])?.length)     parts.push(`SPEC ${(audit.specialList as any[]).length}`);
       if ((audit.incompleteList as any[])?.length)  parts.push(`INC ${(audit.incompleteList as any[]).length}`);
       if (parts.length > 0) recomm = parts.join("; ");
+      // After the supplementary sitting: two or fewer units still failed → proceeds and carries them forward (ENG.14)
+      if ((audit as any).carryForward?.eligible) recomm = "CARRY FORWARD";
     }
 
     // Student matters
@@ -581,6 +611,9 @@ export const generateConsolidatedMarkSheet = async (
       const g = (spec.grounds || "").split(":").pop()?.trim().toUpperCase() || "";
       if (g && g !== "SPECIAL" && g !== "REASON PENDING") mattersList.push(g);
     }
+
+    const cfUnits: Array<{ code: string }> = (audit as any).carryForward?.units || [];
+    if (cfUnits.length > 0) mattersList.push(`C/F: ${cfUnits.map((u) => u.code).join(", ")}`);
 
     const finalMatters = Array.from(new Set(mattersList)).join(", ");
 
@@ -737,29 +770,18 @@ export const generateConsolidatedMarkSheet = async (
   summaryHeaderCell.value = "SUMMARY";
   summaryHeaderCell.font  = { bold: true, size: 10, underline: true, name: fontName };
 
-  const summaryData: Record<string, number> = {
-    PASS: 0, SUPPLEMENTARY: 0, "REPEAT YEAR": 0, "STAY OUT": 0,
-    SPECIAL: 0, INCOMPLETE: 0, "ACADEMIC LEAVE": 0,
-    DEFERMENT: 0, "DEREGISTERED/DISC": 0,
-    // CHANGE 2: Disciplinary suspension now shows in the summary table
-    "DISCIPLINARY SUSPENSION": 0,
-  };
+  const summaryData: Record<string, number> = Object.fromEntries(SUMMARY_LABELS.map((l) => [l, 0]));
 
+  let summarised = 0;
   sheet.getColumn(tuColIdx + 3).eachCell({ includeEmpty: false }, (cell, rowNum) => {
     if (rowNum > 10 && rowNum <= lastDataRow) {
-      const txt = cell.value?.toString().toUpperCase() || "";
-      if      (txt === "PASS")                                    summaryData.PASS++;
-      else if (txt.includes("SUPP"))                              summaryData.SUPPLEMENTARY++;
-      else if (txt.includes("REPEAT"))                            summaryData["REPEAT YEAR"]++;
-      else if (txt.includes("STAY OUT"))                          summaryData["STAY OUT"]++;
-      else if (txt.includes("SPEC"))                              summaryData.SPECIAL++;
-      else if (txt.includes("ACADEMIC LEAVE"))                    summaryData["ACADEMIC LEAVE"]++;
-      else if (txt.includes("DEFERMENT"))                         summaryData.DEFERMENT++;
-      else if (txt.includes("INC"))                               summaryData.INCOMPLETE++;
-      else if (txt.includes("DEREG") || txt.includes("DISC"))     summaryData["DEREGISTERED/DISC"]++;
-      else if (txt.includes("DISCIPLINARY"))                      summaryData["DISCIPLINARY SUSPENSION"]++;
+      summaryData[classifyRecommendation(cell.value?.toString() || "")]++;
+      summarised++;
     }
   });
+  if (summarised !== currentIndex) {
+    console.warn(`[CMS] summary counted ${summarised} recommendation cells for ${currentIndex} students`);
+  }
 
   const activeSummaryEntries = Object.entries(summaryData).filter(([, count]) => count > 0);
   activeSummaryEntries.forEach(([label, count], i) => {
@@ -848,7 +870,6 @@ export const generateConsolidatedMarkSheet = async (
 
   lap("build sheet");
   const result = await workbook.xlsx.writeBuffer();
-  lap("write file");
-  lap.done();
+  lap("write file"); lap.done();
   return Buffer.from(result as ArrayBuffer);
 };

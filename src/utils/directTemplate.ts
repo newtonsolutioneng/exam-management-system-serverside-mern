@@ -10,8 +10,8 @@ import InstitutionSettings from "../models/InstitutionSettings";
 import config from "../config/config";
 import mongoose from "mongoose";
 import { MarkDistribution, resolveDistribution, encodeSheetMeta, META_CELL } from "./markDistribution";
- import { buildRichRegNo, buildScoresheetStudentList, getExistingMarksForStudents, ScoresheetStudent } from "./scoresheetStudentList";
- import { loadInstitutionSettings } from "./loadInstitutionSettings";
+import { buildRichRegNo, buildScoresheetStudentList, getExistingMarksForStudents, ScoresheetStudent } from "./scoresheetStudentList";
+import { loadInstitutionSettings } from "./loadInstitutionSettings";
 
 export const generateDirectScoresheetTemplate = async (
   programId:      mongoose.Types.ObjectId,
@@ -24,7 +24,7 @@ export const generateDirectScoresheetTemplate = async (
   extraRegNos:    string[] = [],                    // students outside the main class to add to the sheet
   unitType:       "theory" | "lab" | "workshop" = "theory",
   examMode:       "standard" | "mandatory_q1" = "standard",
- ): Promise<Buffer> => {
+): Promise<Buffer> => {
   const lap = lapTimer("direct scoresheet");
   const [program, unit, academicYear] = await Promise.all([
     Program.findById(programId).lean()           as Promise<any>,
@@ -52,7 +52,7 @@ export const generateDirectScoresheetTemplate = async (
     academicYear.session === "SUPPLEMENTARY" ? "SUPPLEMENTARY" :
     academicYear.session === "CLOSED"        ? "CLOSED"        : "ORDINARY";
 
-  lap("programUnit");  
+  lap("programUnit");
   const eligibleStudents: ScoresheetStudent[] = await buildScoresheetStudentList({
     programId, programUnitId: programUnitDoc?._id ?? unitId,
     unitId, yearOfStudy, academicYearId, session, passMark,
@@ -137,7 +137,7 @@ export const generateDirectScoresheetTemplate = async (
       row.getCell(3).value = ss.name.toUpperCase();
       row.getCell(4).value = ss.attemptLabel;
       row.getCell(3).font  = { name: fontName, size: 8 };
-      const shouldPrePopulateCA = (ss.isSpecial || ss.isCarriedSpecial) &&
+      const shouldPrePopulateCA = (ss.isSpecial || ss.isCarriedSpecial || ss.lockCA) &&
                                prevMark &&
                                (prevMark.caTotal30 ?? 0) > 0;
  
@@ -162,10 +162,9 @@ export const generateDirectScoresheetTemplate = async (
     for (let c = 1; c <= 10; c++) {
       const cell = row.getCell(c);
       cell.border = thin; cell.font = { name: fontName, size: 8 }; cell.alignment = { vertical: "middle" };
-
       // Reg no / name / attempt stay editable so students outside the class can be typed into spare rows
       if (c >= 2 && c <= 4) cell.protection = { locked: false };
- 
+
       if (c === 5) {
         if (ss?.isSupp) {
           cell.fill       = greyFill;
@@ -173,7 +172,7 @@ export const generateDirectScoresheetTemplate = async (
           cell.value = 0;  // force to 0, never user-editable
         }
         // ENG.18c: Special/deferred-special students — CA pre-populated and locked
-        else if (ss?.isSpecial || ss?.isCarriedSpecial) {
+        else if (ss?.isSpecial || ss?.isCarriedSpecial || (ss?.lockCA && (ss.prevMark?.caTotal30 ?? 0) > 0)) {
           cell.fill       = greyFill;
           cell.protection = { locked: true };
           // Value already set above in the pre-population block
@@ -183,11 +182,11 @@ export const generateDirectScoresheetTemplate = async (
           cell.fill = pinkFill;
           cell.protection = { locked: false };
           cell.dataValidation = { type: "decimal", operator: "between", formulae: [0, dist.ca], allowBlank: true, showErrorMessage: true, errorTitle: "Invalid CA", error: `0–${dist.ca}`};
-         }
+        }
       } else if (c === 6) {
         cell.fill = purpleFill; cell.protection = { locked: false };
         cell.dataValidation = { type: "decimal", operator: "between", formulae: [0, dist.exam], allowBlank: true, showErrorMessage: true, errorTitle: "Invalid Exam", error: `0–${dist.exam}` };
-       } else if (c === 8) {
+      } else if (c === 8) {
         cell.protection = { locked: false };
         cell.dataValidation = { type: "decimal", operator: "between", formulae: [0, 100], allowBlank: true };
       } else if (c >= 7) { cell.fill = greyFill; cell.protection = { locked: true }; }

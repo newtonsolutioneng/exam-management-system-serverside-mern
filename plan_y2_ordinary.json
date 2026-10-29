@@ -1,0 +1,12 @@
+{
+  "_comment": "Cohort B, Year 2, ordinary session of 2019/2020. Unit codes assume the default curriculum (TST 2101-2105 semester 1, TST 2206-2209 semester 2). Check cell H12 of a downloaded sheet and edit the codes below if yours differ.",
+  "ordinaryFail": {
+    "E024-01-2010/2018": ["TST 2101"],
+    "E024-01-2012/2018": ["TST 2103", "TST 2206"],
+    "E024-01-2014/2018": ["TST 2105"]
+  },
+  "absent": {
+    "E024-01-2011/2018": ["TST 2102"],
+    "E024-01-2013/2018": ["TST 2104"]
+  }
+}

@@ -19,6 +19,7 @@ import { performAcademicAudit, applyRepeatUnitRule } from "./academicAudit";
 import { getAttemptLabel, REG_QUALIFIERS, classifyWAA } from "../utils/academicRules";
 import { validateHistoricalYears } from "./historicalYearValidator";
 import { outstandingAttachments } from "./attachments";
+import { carryForwardVerdict, type CarryForwardVerdict, type FailedUnitInfo } from "../utils/carryForwardVerdict";
 
 function _qualifierShouldClearOnPromotion(qualifier: string): boolean {
   if (!qualifier || qualifier.trim() === "") return false;
@@ -88,41 +89,45 @@ export interface StudentStatusResult {
   academicYearName: string;
   summary: { totalExpected: number; passed: number; failed: number; missing: number; isOnLeave?: boolean };
   passedList:    { code: string; mark: number }[];
-  failedList:    { displayName: string; attempt: string | number; programUnitId: string }[];
-  specialList:   { displayName: string; grounds: string; programUnitId: string }[];
+  failedList:    { displayName: string; attempt: string | number; programUnitId: string;
+                   code?: string; name?: string; mark?: number; suppSat?: boolean; noCA?: boolean }[];
+  specialList:   { displayName: string; grounds: string; programUnitId: string; code?: string; name?: string }[];
   deferredList:  { displayName: string; programUnitId: string; reason: string }[];
   missingList:   string[];
   incompleteList: string[];
   leaveDetails?: string;
+  /** set when the failed units were all sat at supplementary and ENG.14 lets the student carry them forward */
+  carryForward?: CarryForwardVerdict;
 }
 
 // ── calculateStudentStatus ────────────────────────────────────────────────────
+
 export const calculateStudentStatus = async (
   studentId: any, programId: any, academicYearName: string,
   yearOfStudy: number = 1,
   /** `memo`: pass one Map per request (e.g. a promotion analysis) so class-wide look-ups are read once, not once per student. */
   options: {
-        forPromotion?: boolean;
-        memo?: Map<string, Promise<any>>;
-        /** records the caller already loaded for the whole class; skips this student's own queries */
-        prefetched?: { student: any; detailed: any[]; direct: any[]; grades: any[] };
-      } = {},
- ): Promise<StudentStatusResult> => {
+    forPromotion?: boolean;
+    memo?: Map<string, Promise<any>>;
+    /** records the caller already loaded for the whole class; skips this student's own queries */
+    prefetched?: { student: any; detailed: any[]; direct: any[]; grades: any[] };
+  } = {},
+): Promise<StudentStatusResult> => {
   const memo = <T>(key: string, load: () => Promise<T>): Promise<T> => {
     if (!options.memo) return load();
     if (!options.memo.has(key)) options.memo.set(key, load());
     return options.memo.get(key) as Promise<T>;
   };
- 
+
   const settings = await memo("settings", async () => InstitutionSettings.findOne().lean());
   if (!settings) throw new Error("Institution settings not found.");
   const passMark = (settings as any).passMark || 40;
-
   // ENG 23(c): absences that trigger deregistration (setting, default 6)
   const maxAbsent = (settings as any).ruleSet?.maxAbsentExams ?? 6;
   // ENG.10(e): a missed exam scores 0 (the unit is failed) instead of being listed as missing. Off by default.
   const enforcePractical = (settings as any).ruleSet?.enforcePracticalPass === true;
   const missedExamZero = (settings as any).ruleSet?.missedExamScoresZero === true;
+
   const student = options.prefetched?.student ?? await Student.findById(studentId).lean();
   if (!student) throw new Error("Student not found");
 
@@ -175,7 +180,7 @@ export const calculateStudentStatus = async (
   // ── Curriculum ────────────────────────────────────────────────────────────
   const curriculum = await memo(`curriculum:${programId}:${yearOfStudy}`, async () =>
     ProgramUnit.find({ program: programId, requiredYear: yearOfStudy }).populate("unit").lean()) as any[];
-  
+
   if (!curriculum?.length) {
     return {
       status: "CURRICULUM NOT SET", variant: "info", details: `No units defined for Year ${yearOfStudy}.`,
@@ -359,7 +364,8 @@ export const calculateStudentStatus = async (
 
   const currentYearDoc = targetYearDoc?.isCurrent
     ? targetYearDoc
-    : (await AcademicYear.findOne({ isCurrent: true }).lean()) || (await AcademicYear.findOne().sort({ startDate: -1 }).lean());
+    : await memo("currentYear", async () =>
+        (await AcademicYear.findOne({ isCurrent: true }).lean()) || (await AcademicYear.findOne().sort({ startDate: -1 }).lean()));
 
   const targetSession   = targetYearDoc?.session ?? "ORDINARY";
   const [tStart]        = (resolvedYearName || "0/0").split("/").map(Number);
@@ -401,6 +407,38 @@ export const calculateStudentStatus = async (
     details = `All pending units deferred to next ordinary period (ENG.13b/18c). Eligible for promotion.`;
   }
 
+  // Structured unit details (code, name, whether the supplementary has been sat) for reports and the carry-forward rule.
+  const splitName = (displayName: string) => {
+    const i = displayName.indexOf(":");
+    return i === -1 ? { code: displayName.trim(), name: "" } : { code: displayName.slice(0, i).trim(), name: displayName.slice(i + 1).trim() };
+  };
+  const failedDetailed = lists.failed.map((f) => {
+    const raw = marksMap.get(f.programUnitId);
+    const { code, name } = splitName(f.displayName);
+    return {
+      ...f, code, name,
+      mark:    raw?.agreedMark ?? 0,
+      suppSat: raw?.attempt === "supplementary",
+      // A supplementary mark carries no coursework by design (ENG.13f), so only a first-sitting row can show "no CA".
+      noCA:    raw?.attempt !== "supplementary" && !((raw?.caTotal30 || 0) > 0),
+    };
+  });
+  const specialDetailed = lists.special.map((u) => ({ ...u, ...splitName(u.displayName) }));
+
+  // Carry forward (ENG.14): only decided in the SUPP branch, once every failed unit has been through a supplementary.
+  let carryForward: CarryForwardVerdict | undefined;
+  if (status.startsWith("SUPP") && failCount > 0 && specialCount === 0) {
+    const program: any = await memo(`program:${programId}`, async () =>
+      (await import("../models/Program")).default.findById(programId).select("durationYears degreeType").lean());
+    const v = carryForwardVerdict({
+      failed: failedDetailed.map((f): FailedUnitInfo => ({ code: f.code, name: f.name, suppSat: f.suppSat, noCA: f.noCA })),
+      otherOutstanding: incCount + missingCount,
+      totalUnits, yearOfStudy,
+      durationYears: program?.durationYears ?? 5, degreeType: program?.degreeType,
+    });
+    if (v.eligible) carryForward = v;
+  }
+
   return {
     status, variant, details,
     weightedMean:     officialMean.toFixed(2),
@@ -408,13 +446,15 @@ export const calculateStudentStatus = async (
     academicYearName: resolvedYearName,
     summary: { totalExpected: totalUnits, passed: lists.passed.length, failed: failCount, missing: missingCount },
     passedList:    lists.passed,
-    failedList:    lists.failed,
-    specialList:   lists.special,
+    failedList:    failedDetailed,
+    specialList:   specialDetailed,
     deferredList:  pendingDeferredUnits,
     missingList:   lists.missing,
     incompleteList: lists.incomplete,
+    ...(carryForward ? { carryForward } : {}),
   };
 };
+
 
 /**
  * Puts a student on stay-out: remembers the failed units (they drive ENG.22(c)/(e) when the retake
@@ -465,12 +505,12 @@ export const promoteStudent = async (studentId: string): Promise<{
   const auditResult = await performAcademicAudit(studentId);
   if (auditResult.discontinued)
     return { success: false, message: `Discontinued: ${auditResult.reason}` };
- 
+
   // ENG.16(b): four failed attempts at a unit — must repeat the unit, cannot progress.
   const rpu = await applyRepeatUnitRule(studentId);
   if (rpu.blocked)
     return { success: false, message: `Promotion blocked: ${rpu.reason}` };
-  
+ 
   const program  = student.program as any;
   const duration = program.durationYears || 5;
  
@@ -563,7 +603,6 @@ export const promoteStudent = async (studentId: string): Promise<{
  
   // Graduation path (final year)
   if (currentYear === duration) {
-
     // ENG.15(f)(g) / ENG.24(a): every unit of the final year must be passed.
     // A failed, missing, incomplete, special or deferred unit blocks graduation.
     const outstanding = [
@@ -579,20 +618,19 @@ export const promoteStudent = async (studentId: string): Promise<{
         message: `Cannot graduate (ENG.15(f)/24(a)): ${outstanding.length} final-year unit(s) not passed: ${outstanding.join("; ")}`,
         details: statusResult,
       };
-
     if (pendingCF > 0)
       return { success: false, message: `Cannot graduate: ${pendingCF} carry-forward unit(s) not yet cleared` };
- 
+
     // ENG.24(b),(c): attachments / teaching practicum must be passed (when enforced in settings).
     const missingAtt = await outstandingAttachments(studentId);
     if (missingAtt.length > 0)
       return { success: false, message: `Cannot graduate (ENG.24): ${missingAtt.join("; ")} not passed` };
-
+ 
     const fullHistory = [...((student as any).academicHistory || []), histRecord];
     const finalWAA    = fullHistory.reduce((acc: number, h: any) => acc + (h.weightedContribution || 0), 0);
  
     const classification = classifyWAA(finalWAA);
-
+ 
     await Student.findByIdAndUpdate(studentId, {
       $set:  { status: "graduand", qualifierSuffix: "", finalWeightedAverage: finalWAA.toFixed(2), classification, graduationYear: new Date().getFullYear(), currentYearOfStudy: currentYear + 1 },
       $push: { academicHistory: histRecord },
@@ -769,7 +807,7 @@ export const previewPromotion = async (
       if (!entry.hist.canEnterFinalYear) { computed.set(id, entry); return; }
     }
     entry.sr = await calculateStudentStatus(st._id, programId, academicYearName, yearToPromote, {
-     forPromotion: true, memo,
+      forPromotion: true, memo,
       prefetched: classMarks ? {
         student: st,
         detailed: classMarks.detailed.get(id) ?? [],
@@ -880,7 +918,25 @@ export const previewPromotion = async (
       isEligibleForSupp:
         !["STAYOUT", "REPEAT YEAR", "DEREGISTERED"].includes(sr.status) &&
         (sr.failedList.length > 0 || sr.specialList.length > 0),
+      // Unit-level detail so the Word reports can print unit codes and names.
+      failedUnits:  (sr.failedList  || []).map((f: any) => ({ code: f.code, name: f.name, attempt: f.attempt, mark: f.mark, suppSat: f.suppSat })),
+      specialUnits: (sr.specialList || []).map((u: any) => ({ code: u.code, name: u.name, grounds: u.grounds })),
+      incompleteUnits: sr.incompleteList || [],
+      missingUnits:    sr.missingList || [],
     };
+
+    // After the supplementary sitting: at most two units still failed → the student proceeds and carries them forward (ENG.14).
+    if (sr.carryForward?.eligible) {
+      eligible.push({
+        ...report,
+        status: "CARRY FORWARD",
+        carryForward: true,
+        cfUnits: sr.carryForward.units,
+        reasons: sr.carryForward.units.map((u: any) => `Carry forward: ${u.code}: ${u.name}`),
+        isEligibleForSupp: false,
+      });
+      continue;
+    }
 
     if (sr.status === "PASS") {
       eligible.push(report);

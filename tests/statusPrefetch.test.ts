@@ -7,6 +7,7 @@ import InstitutionSettings from "../src/models/InstitutionSettings";
 import AcademicYear from "../src/models/AcademicYear";
 import ProgramUnit from "../src/models/ProgramUnit";
 import Student from "../src/models/Student";
+import Program from "../src/models/Program";
 import Mark from "../src/models/Mark";
 import MarkDirect from "../src/models/MarkDirect";
 import FinalGrade from "../src/models/FinalGrade";
@@ -29,6 +30,7 @@ function setup(marks: number[]) {
   stub(ProgramUnit, "find", units);
   stub(ProgramUnit, "countDocuments", units.length);
   stub(Student, "findById", student);
+  (Program as any).findById = () => ({ select: () => lean({ durationYears: 4, degreeType: "BSc" }) });
   stub(Mark, "find", []);
   stub(FinalGrade, "find", []);
   const md = units.map((u, i) => direct(u, marks[i]));
@@ -56,4 +58,17 @@ test("expected statuses", async () => {
   const r = await calculateStudentStatus(sid, pid, "2013/2014", 1, { forPromotion: true });
   assert.notEqual(r.status, "PASS");
   assert.equal(r.summary.failed, 1);
+});
+
+test("one unit failed at supplementary: carry-forward verdict with unit details; before the supp: none", async () => {
+  const md = setup([60, 30, 80, 55]);
+  const before = await calculateStudentStatus(sid, pid, "2013/2014", 1, { forPromotion: true });
+  assert.equal(before.carryForward, undefined);
+  assert.deepEqual(before.failedList.map((f) => [f.code, f.name, f.suppSat]), [["U2", "Unit 2", false]]);
+
+  const supp = md.map((m, i) => (i === 1 ? { ...m, attempt: "supplementary", caTotal30: 0, examTotal70: 30, agreedMark: 30 } : m));
+  stub(MarkDirect, "find", supp);
+  const after = await calculateStudentStatus(sid, pid, "2013/2014", 1, { forPromotion: true });
+  assert.equal(after.carryForward?.eligible, true);
+  assert.deepEqual(after.carryForward?.units.map((u) => u.code), ["U2"]);
 });

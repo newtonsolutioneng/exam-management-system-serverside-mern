@@ -5,8 +5,8 @@ import config from "../config/config";
 import { AwardListEntry } from "../services/graduationEngine";
 import { loadInstitutionSettings } from "./loadInstitutionSettings";
 import { loadLogoBuffer } from "./loadLogoBuffer";
-import { IDocumentMeta } from "../models/InstitutionSettings";
 import { displayRegNo } from "./regNoQualifier";
+import { IDocumentMeta } from "../models/InstitutionSettings";
 
 
 export interface PromotionData {
@@ -15,6 +15,8 @@ export interface PromotionData {
   totalYears?: number;
   eligible: any[];  blocked: any[];  logoBuffer: Buffer; offeredUnits?: { code: string; name: string }[];
   examType?: "ORDINARY" | "SUPPLEMENTARY"; institutionId: string;
+  /** "BEd" changes the rule cited for stay-out after supplementary (ENG.15(e) instead of 15(d)) */
+  degreeType?: string;
 }
 
 export const numberToWords = (num: number): string => {
@@ -46,6 +48,15 @@ const getOrdinalYear = (year: number): string => {
   const ordinals = ["", "First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh"];
   return ordinals[year] || `${year}th`;
 };
+
+/** Name of the board for the session: the supplementary & special sitting is a separate board. */
+const examTypeOf = (d: unknown): string | undefined => (d as { examType?: string } | undefined)?.examType;
+const boardOf = (meta: IDocumentMeta, d?: unknown): string =>
+  examTypeOf(d) === "SUPPLEMENTARY"
+    ? `${meta.schoolName} Board of Examiners for Specials and Supplementaries`
+    : `${meta.schoolName} Board of Examiners`;
+const examsOf = (d?: unknown): string =>
+  examTypeOf(d) === "SUPPLEMENTARY" ? "Supplementary and Special Examinations" : "Examinations";
 
 const formatStudentName = (fullName: string): string => {
   if (!fullName) return "";
@@ -112,9 +123,10 @@ function createDocHeader(
   ];
 }
 
-function createDocFooter(meta: IDocumentMeta): Paragraph[] {
+function createDocFooter(meta: IDocumentMeta, examType?: string): Paragraph[] {
+  const board = examType === "SUPPLEMENTARY" ? "BOARD OF EXAMINERS FOR SPECIALS AND SUPPLEMENTARIES" : "BOARD OF EXAMINERS";
   return [
-    new Paragraph({ spacing: { before: 900 }, children: [new TextRun({ text: `APPROVED BY THE BOARD OF EXAMINERS, ${meta.schoolName.toUpperCase()}`, bold: true, size: 18 })] }),
+    new Paragraph({ spacing: { before: 900 }, children: [new TextRun({ text: `APPROVED BY THE ${board}, ${meta.schoolName.toUpperCase()}`, bold: true, size: 18 })] }),
     new Paragraph({ spacing: { before: 400 }, children: [new TextRun({ text: "SIGNED: __________________________\t\tDATE: _______________", bold: true })] }),
     new Paragraph({ children: [new TextRun({ text: `\tDEAN, ${meta.schoolName.toUpperCase()}`, size: 18 })] }),
   ];
@@ -126,7 +138,8 @@ export const generatePromotionWordDoc = async ( data: PromotionData ): Promise<B
   const currentYearOrdinal = getOrdinalYear(yearOfStudy);
 
   const stats: Record<string, number> = {
-    "PASS": eligible.length,
+    "PASS": eligible.filter(s => !s.carryForward).length,
+    "CARRY FORWARD": eligible.filter(s => s.carryForward).length,
     "SUPPLEMENTARY (After Readmission)": blocked.filter(s => s.status === "SUPPLEMENTARY" && s.reasons?.some((r: string) => r.toLowerCase().includes("readmission"))).length,
     "SUPPLEMENTARY (After Stayout)": blocked.filter(s => s.status === "SUPPLEMENTARY" && s.reasons?.some((r: string) => r.toLowerCase().includes("stayout"))).length,
     "SUPPLEMENTARY (After Carry Forward)": blocked.filter(s => s.status === "SUPPLEMENTARY" && s.reasons?.some((r: string) => r.toLowerCase().includes("carry forward"))).length,
@@ -144,6 +157,11 @@ export const generatePromotionWordDoc = async ( data: PromotionData ): Promise<B
     "SPECIALS (OTHER)": blocked.filter(s => s.status.includes("SPEC") && !s.remarks?.toLowerCase().match(/financial|compassionate|medical/)).length,
   };
 
+  // Whoever the rows above do not cover is still counted, so the total always equals the number of candidates listed.
+  const counted = Object.entries(stats).filter(([k]) => k !== "PASS" && k !== "CARRY FORWARD").reduce((a, [, v]) => a + v, 0);
+  const uncategorised = blocked.length - counted;
+  if (uncategorised > 0) stats["OTHER"] = uncategorised;
+
   const doc = new Document({
     sections: [
       {
@@ -154,7 +172,7 @@ export const generatePromotionWordDoc = async ( data: PromotionData ): Promise<B
 
       new Paragraph({ alignment: AlignmentType.CENTER, spacing: { before: 400, after: 100 }, children: [new TextRun({ text: "UNITS OFFERED", bold: true, size: 22, underline: {} })] }),
         createOfferedUnitsTable(offeredUnits),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
         ],
       },
     ],
@@ -261,7 +279,7 @@ export const generateEligibleSummaryDoc = async ( data: any ): Promise<Buffer> =
       {
         properties: {},
         children: [
-          ...createDocHeader( logoBuffer, programName, academicYear, currentYearOrdinal, "PASS", meta, "ORDINARY" ),
+          ...createDocHeader( logoBuffer, programName, academicYear, currentYearOrdinal, "PASS", meta, data.examType || "ORDINARY" ),
 
           new Paragraph({
             alignment: AlignmentType.JUSTIFIED,
@@ -269,24 +287,24 @@ export const generateEligibleSummaryDoc = async ( data: any ): Promise<Buffer> =
             children: [
               new TextRun({ text: `The following `, size: 22 }),
               new TextRun({ text: `${candidateCountWords} (${eligible.length}) `, bold: true, size: 22  }),
-              new TextRun({ text: `candidates satisfied the ${meta.schoolName} Board of Examiners in the `, size: 22   }),
+              new TextRun({ text: `candidates satisfied the ${boardOf(meta, data)} in the `, size: 22   }),
               new TextRun({ text: `${academicYear} `, bold: true, size: 22 }),
               new TextRun({ text: `Academic Year, `, size: 22 }),
               new TextRun({ text: `${currentYearOrdinal} Year `, bold: true, size: 22  }),
-              new TextRun({ text: `Examinations for the `, size: 22 }),
+              new TextRun({ text: `${examsOf(data)} for the `, size: 22 }),
               new TextRun({ text: `${programName}. `, bold: true, size: 22  }),
               ...(isFinalYear
-                ? [new TextRun({ text: `The ${meta.schoolName} Board of Examiners recommends that they be considered for the award of the degree.`, size: 22 })]
-                    : [
-                new TextRun({ text: `The ${meta.schoolName} Board of Examiners recommends that they proceed to their `, size: 22 }),
-                       new TextRun({ text: `${nextYearOrdinal} Year `, bold: true, size: 22 }),
-                       new TextRun({ text: `of study.`, size: 22 }),
-              ]),  
+                ? [new TextRun({ text: `The ${boardOf(meta, data)} recommends that they be considered for the award of the degree.`, size: 22 })]
+                : [
+                    new TextRun({ text: `The ${boardOf(meta, data)} recommends that they proceed to their `, size: 22 }),
+                    new TextRun({ text: `${nextYearOrdinal} Year `, bold: true, size: 22 }),
+                    new TextRun({ text: `of study.`, size: 22 }),
+                  ]),
             ],
           }),
 
           createPassTable(eligible, cellMargin),
-          ...createDocFooter(meta),         
+          ...createDocFooter(meta, examTypeOf(data)),         
         ],
       },
     ],
@@ -318,7 +336,11 @@ function createPassTable(students: any[], cellMargin: any) {
               ...(s.qualifierSuffix ? [new TextRun({ text: s.qualifierSuffix, size: 16, subScript: true, color: "000000" })] : []),
             ] })
           ] }),
-          new TableCell({ margins: cellMargin, children: [ new Paragraph({ spacing: { before: 0, after: 0 }, children: [new TextRun({ text: formatStudentName(s.name), size: 20 })]})] })] }),
+          new TableCell({ margins: cellMargin, children: [ new Paragraph({ spacing: { before: 0, after: 0 }, children: [
+            new TextRun({ text: formatStudentName(s.name), size: 20 }),
+            // * = proceeds with unit(s) carried forward (ENG.14); the units are listed under the table
+            ...(s.carryForward ? [new TextRun({ text: " *", bold: true, size: 20 })] : []),
+          ]})] })] }),
   );
 
   return new Table({
@@ -396,17 +418,17 @@ export const generateSpecialExamsDoc = async (
               new TextRun({ text: `${academicYear} `,                     bold: true,        size: 22 }),
               new TextRun({ text: "Academic Year, ",                                        size: 22 }),
               new TextRun({ text: `${currentYearOrdinal} Year `,                            size: 22 }),
-              new TextRun({ text: "Examinations for the ",                                  size: 22 }),
+              new TextRun({ text: `${examsOf(data)} for the `, size: 22 }),
               new TextRun({ text: `${programName}. `,                     bold: true,        size: 22 }),
               new TextRun({
-                text: `The ${meta.schoolName} Board of Examiners upholds the decision of the Dean's Committee. `,
+                text: `The ${boardOf(meta, data)} upholds the decision of the Dean's Committee. `,
                 size: 22,
               }),
             ],
           }),
 
           createSpecialUnitDetailTable(list, cellMargin),
-          ...createDocFooter(meta),
+          ...createDocFooter(meta, examTypeOf(data)),
         ],
       },
     ],
@@ -441,9 +463,10 @@ function createSpecialUnitDetailTable(students: any[], cellMargin: any): Table {
   let counter = 1;
 
   for (const s of students) {
-    const specialReasons = (s.reasons || []).filter((r: string) =>
-      r.toUpperCase().includes("SPECIAL"),
-    );
+    const structuredSpecials = unitsForStudent(s, "special");
+    const specialReasons: string[] = structuredSpecials.length
+      ? structuredSpecials.map((u) => `${u.code}: ${u.name}`)
+      : (s.reasons || []).filter((r: string) => r.toUpperCase().includes("SPECIAL") && r.includes(":"));
 
     if (specialReasons.length > 0) {
       specialReasons.forEach((reason: string, idx: number) => {
@@ -542,7 +565,7 @@ export const generateIncompleteListDoc = async (data: PromotionData): Promise<Bu
           ],
         }),
         createStandardUnitDetailTable(incompleteList, cellMargin,"INCOMPLETE"),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ],
     }],
   });
@@ -571,15 +594,17 @@ export const generateStayoutExamsDoc = async ( data: PromotionData ): Promise<Bu
             children: [
               new TextRun({ text: `The following `, size: 22 }),
               new TextRun({ text: `${candidateCountWords} (${count}) `, bold: true, size: 22  }),
-              new TextRun({ text: `candidate(s) failed to satisfy the ${meta.schoolName} Board of Examiners in the unit(s) indicated against their names during the `, size: 22   }),
+              new TextRun({ text: `candidate(s) failed to satisfy the ${boardOf(meta, data)} in the unit(s) indicated against their names during the `, size: 22   }),
               new TextRun({ text: `${academicYear} `, bold: true, size: 22 }),
               new TextRun({ text: `Academic Year, `, size: 22 }),
               new TextRun({ text: `${currentYearOrdinal} Year `, bold: true, size: 22  }),
-              new TextRun({ text: `Examinations for the `, size: 22 }),
+              new TextRun({ text: `${examsOf(data)} for the `, size: 22 }),
               new TextRun({ text: `${programName}. `, bold: true, size: 22  }),
-              new TextRun({ text: `The ${meta.schoolName} Board of Examiners recommends that they Stay Out according to `, size: 22 }),         
+              new TextRun({ text: `The ${boardOf(meta, data)} recommends that they Stay Out according to `, size: 22 }),         
               new TextRun({
-                text: `ENG Rule 15 (h) "A candidate who fails more than a third and less than a half of the prescribed units in any year of study shall be required to retake examinations only in the failed units during the ordinary examination period when examinations for the individual units are offered. Such a candidate will not be allowed to retake examinations during the supplementary period immediately following the ordinary examinations period in which he/she failed the units".`,
+                text: data.examType === "SUPPLEMENTARY"
+                  ? `ENG Rule ${data.degreeType === "BEd" ? "15 (e)" : "15 (d)"}: a candidate who still fails more than two units after the supplementary examinations does not proceed to the next year of study, and shall retake the failed units during the next ordinary examination period.`
+                  : `ENG Rule 15 (h) "A candidate who fails more than a third and less than a half of the prescribed units in any year of study shall be required to retake examinations only in the failed units during the ordinary examination period when examinations for the individual units are offered. Such a candidate will not be allowed to retake examinations during the supplementary period immediately following the ordinary examinations period in which he/she failed the units".`,
                 size: 20, bold: true, italics: true,
               }),
             ],
@@ -587,7 +612,7 @@ export const generateStayoutExamsDoc = async ( data: PromotionData ): Promise<Bu
 
           createStandardUnitDetailTable(stayoutList, cellMargin),
 
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
         ],
       },
     ],
@@ -614,13 +639,13 @@ export const generateRepeatYearDoc = async (data: PromotionData): Promise<Buffer
           children: [
             new TextRun({ text: `The following `, size: 22 }),
             new TextRun({ text: `${numberToWords(count)} (${count}) `, bold: true, size: 22  }),
-            new TextRun({ text: `candidate(s) failed to satisfy the ${meta.schoolName} Board of Examiners in the unit(s) indicated against their names during the `, size: 22   }),
+            new TextRun({ text: `candidate(s) failed to satisfy the ${boardOf(meta, data)} in the unit(s) indicated against their names during the `, size: 22   }),
             new TextRun({ text: `${academicYear} `, bold: true, size: 22 }),
             new TextRun({ text: `Academic Year, `, size: 22 }),
             new TextRun({ text: `${currentYearOrdinal} Year `, bold: true, size: 22  }),
-            new TextRun({ text: `Examinations for the `, size: 22 }),
+            new TextRun({ text: `${examsOf(data)} for the `, size: 22 }),
             new TextRun({ text: `${programName}. `, bold: true, size: 22  }),
-            new TextRun({ text: `The ${meta.schoolName} Board of Examiners recommends that they Repeat according to `, size: 22 }),         
+            new TextRun({ text: `The ${boardOf(meta, data)} recommends that they Repeat according to `, size: 22 }),         
             new TextRun({
               text: `ENG Rule 16 (c) "A candidate, who attains an average mark of less than 40% in any year of study based on the marks obtained on the 1st attempt for each unit, shall be required to repeat the entire year. Such a candidate will enrol for all the units and sit for all CATs and assignment and the exams will be marked out of 100%. `,
               size: 20, bold: true, italics: true,
@@ -630,7 +655,7 @@ export const generateRepeatYearDoc = async (data: PromotionData): Promise<Buffer
 
         createStandardUnitDetailTable(list, cellMargin),
         
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ],
     }],
   });
@@ -687,7 +712,7 @@ export const generateAcademicLeaveDoc = async (
           }),
 
           createAdministrativeTable(formattedList, cellMargin),
-          ...createDocFooter(meta),
+          ...createDocFooter(meta, examTypeOf(data)),
         ],
       },
     ],
@@ -729,7 +754,7 @@ function createAdministrativeTable(students: any[], cellMargin: any) {
 export const generateCarryForwardDoc = async (data: PromotionData): Promise<Buffer> => {
   const { programName, academicYear, yearOfStudy, eligible, institutionId } = data;
   const { meta, logoBuffer } = await getDocContext(data);
-  const carryForwardList = eligible.filter((s) => s.reasons?.length > 0 && s.status !== "ALREADY PROMOTED"  );
+  const carryForwardList = eligible.filter((s) => s.carryForward && s.status !== "ALREADY PROMOTED");
   const count = carryForwardList.length;
   const currentYearOrdinal = getOrdinalYear(yearOfStudy);
   const nextYearOrdinal = getOrdinalYear(yearOfStudy + 1);
@@ -745,7 +770,7 @@ export const generateCarryForwardDoc = async (data: PromotionData): Promise<Buff
           children: [
             new TextRun({ text: `The following `, size: 22 }),
             new TextRun({ text: `${numberToWords(count)} (${count}) `, bold: true, size: 22 }),
-            new TextRun({ text: `candidate(s) satisfied the Board of Examiners in at least two-thirds of the units. In accordance with `, size: 22 }),
+            new TextRun({ text: `candidate(s) satisfied the ${boardOf(meta, data)} in at least two-thirds of the units. In accordance with `, size: 22 }),
             new TextRun({ text: `ENG Rule 13 (e)`, bold: true, size: 22 }),
             new TextRun({ text: `, they are allowed to proceed to `, size: 22 }),
             new TextRun({ text: `${nextYearOrdinal} Year `, bold: true, size: 22 }),
@@ -754,7 +779,7 @@ export const generateCarryForwardDoc = async (data: PromotionData): Promise<Buff
         }),
 
         createStandardUnitDetailTable(carryForwardList, cellMargin),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ],
     }],
   });
@@ -780,13 +805,13 @@ export const generateDiscontinuationDoc = async (data: PromotionData): Promise<B
           children: [
             new TextRun({ text: "The following ", size: 22 }),
             new TextRun({ text: `${numberToWords(count)} (${count}) `, bold: true, size: 22 }),
-            new TextRun({ text: `candidate(s) failed to satisfy the ${meta.schoolName} Board of Examiners in the unit(s) indicated against their names during the `, size: 22   }),
+            new TextRun({ text: `candidate(s) failed to satisfy the ${boardOf(meta, data)} in the unit(s) indicated against their names during the `, size: 22   }),
             new TextRun({ text: `${academicYear} `, bold: true, size: 22 }),
             new TextRun({ text: `Academic Year, `, size: 22 }),
             new TextRun({ text: `${currentYearOrdinal} Year `, bold: true, size: 22  }),
-            new TextRun({ text: `Examinations for the `, size: 22 }),
+            new TextRun({ text: `${examsOf(data)} for the `, size: 22 }),
             new TextRun({ text: `${programName}. `, bold: true, size: 22  }),
-            new TextRun({ text: `The ${meta.schoolName} Board of Examiners recommends that they be `, size: 22 }),         
+            new TextRun({ text: `The ${boardOf(meta, data)} recommends that they be `, size: 22 }),         
             new TextRun({ text: `Discontinued  `, bold:true,  size: 22 }),         
             new TextRun({ text: `according to `, size: 22 }),         
             new TextRun({
@@ -796,7 +821,7 @@ export const generateDiscontinuationDoc = async (data: PromotionData): Promise<B
           ],
         }),
         createStandardUnitDetailTable(list, cellMargin),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ]
     }]
   });
@@ -822,13 +847,13 @@ export const generateDeregistrationDoc = async (data: PromotionData): Promise<Bu
           children: [
             new TextRun({ text: `The following `, size: 22 }),
             new TextRun({ text: `${candidateCountWords} (${count}) `, bold: true, size: 22  }),
-            new TextRun({ text: `candidate(s) failed to satisfy the ${meta.schoolName} Board of Examiners in the unit(s) indicated against their names during the `, size: 22   }),
+            new TextRun({ text: `candidate(s) failed to satisfy the ${boardOf(meta, data)} in the unit(s) indicated against their names during the `, size: 22   }),
             new TextRun({ text: `${academicYear} `, bold: true, size: 22 }),
             new TextRun({ text: `Academic Year, `, size: 22 }),
             new TextRun({ text: `${currentYearOrdinal} Year `, bold: true, size: 22  }),
-            new TextRun({ text: `Examinations for the `, size: 22 }),
+            new TextRun({ text: `${examsOf(data)} for the `, size: 22 }),
             new TextRun({ text: `${programName}. `, bold: true, size: 22  }),
-            new TextRun({ text: `The ${meta.schoolName} Board of Examiners recommends that they be `, size: 22 }),         
+            new TextRun({ text: `The ${boardOf(meta, data)} recommends that they be `, size: 22 }),         
             new TextRun({ text: `Deregistered `, bold:true,  size: 22 }),         
             new TextRun({ text: `according to `, size: 22 }),         
             new TextRun({
@@ -839,12 +864,39 @@ export const generateDeregistrationDoc = async (data: PromotionData): Promise<Bu
         }),
 
         createStandardUnitDetailTable(list, cellMargin),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ]
     }]
   });
   return await Packer.toBuffer(doc);
 };
+
+/** "CODE: Unit name (note)" → { code, name } */
+const parseUnitText = (text: string): { code: string; name: string } => {
+  const i = text.indexOf(":");
+  return i === -1 ? { code: text.trim(), name: "" } : { code: text.slice(0, i).trim(), name: text.slice(i + 1).trim() };
+};
+
+/**
+ * The units to print against a student. Uses the structured details from the promotion analysis (code + name);
+ * falls back to the older "CODE: Name" reason strings.
+ */
+export function unitsForStudent(s: any, kind: "failed" | "special" | "incomplete" = "failed"): { code: string; name: string }[] {
+  const dedupe = (list: { code: string; name: string }[]) => {
+    const seen = new Set<string>(); return list.filter((u) => (seen.has(u.code) ? false : (seen.add(u.code), true)));
+  };
+  if (kind === "special") {
+    return dedupe((s.specialUnits || []).filter((u: any) => u?.code).map((u: any) => ({ code: u.code, name: u.name || "" })));
+  }
+  if (kind === "incomplete") {
+    return dedupe([...(s.incompleteUnits || []), ...(s.missingUnits || [])].map((t: string) => parseUnitText(String(t))));
+  }
+  const failed = (s.failedUnits || []).filter((u: any) => u?.code).map((u: any) => ({ code: u.code, name: u.name || "" }));
+  if (failed.length) return dedupe(failed);
+  // e.g. deregistration for absence: no failed marks, the units are the missing ones
+  const missing = (s.missingUnits || []).map((t: string) => parseUnitText(String(t)));
+  return dedupe(missing);
+}
 
 function createStandardUnitDetailTable(students: any[], cellMargin: any, filterKeyword?: string) {
   const headerRow = new TableRow({
@@ -862,29 +914,23 @@ function createStandardUnitDetailTable(students: any[], cellMargin: any, filterK
   let studentCounter = 1;
 
   students.forEach((s) => {
-    const relevantReasons = s.reasons?.filter((r: string) => {
-      const lowerR = r.toLowerCase();
+    const structured = unitsForStudent(s, filterKeyword === "INCOMPLETE" ? "incomplete" : "failed");
+    // Older rows carried the unit in the reason text ("CODE: Name (...)"); keep that as a fallback.
+    const fromReasons = (s.reasons || [])
+      .filter((r: string) => {
+        const lowerR = r.toLowerCase();
+        const isRuleTag = lowerR.startsWith("eng") || lowerR.includes("failures >") || lowerR.includes("failures >=") || lowerR.includes("mean <");
+        if (isRuleTag) return false;
+        if (filterKeyword) return lowerR.includes(filterKeyword.toLowerCase());
+        return !lowerR.includes("special") && !lowerR.includes("leave") && !lowerR.includes("require supplementary") && !lowerR.includes("pending");
+      })
+      .filter((r: string) => r.includes(":"))
+      .map((r: string): { code: string; name: string } => { const u = parseUnitText(r); return { code: u.code, name: u.name.split("(")[0].trim() }; });
+    const units: { code: string; name: string }[] = structured.length ? structured : fromReasons;
 
-      const isRuleTag = lowerR.startsWith("eng") || lowerR.includes("failures >") || lowerR.includes("failures >=") || lowerR.includes("mean <");
-      if (isRuleTag) return false;
-
-      if (filterKeyword) return lowerR.includes(filterKeyword.toLowerCase());
-      return !lowerR.includes("special") && !lowerR.includes("leave");
-    }) || [];
-
-    if (relevantReasons.length > 0) {
-      relevantReasons.forEach((rawReason: string, index: number) => {
+    if (units.length > 0) {
+      units.forEach((u, index) => {
         const isFirstUnit = index === 0;
-        let uCode = "N/A";
-        let uName = "N/A";
-
-        const colonIndex = rawReason.indexOf(":");
-        if (colonIndex !== -1) {
-          uCode = rawReason.substring(0, colonIndex).trim();
-          const afterColon = rawReason.substring(colonIndex + 1);
-          uName = afterColon.split("(")[0].trim();
-        }
-
         rows.push(new TableRow({
           children: [
             new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: isFirstUnit ? studentCounter.toString() : "", size: 18 })] })] }),
@@ -893,8 +939,8 @@ function createStandardUnitDetailTable(students: any[], cellMargin: any, filterK
               ...(isFirstUnit && s.qualifierSuffix ? [new TextRun({ text: s.qualifierSuffix, size: 14, subScript: true })] : []),
             ] })] }),
             new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: isFirstUnit ? s.name : "", size: 18 })] })] }),
-            new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: uCode, size: 18 })] })] }),
-            new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: uName, size: 18 })] })] }),
+            new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: u.code, size: 18 })] })] }),
+            new TableCell({ margins: cellMargin, children: [new Paragraph({ children: [new TextRun({ text: u.name, size: 18 })] })] }),
           ]
         }));
       });
@@ -1068,7 +1114,7 @@ export const generateAwardListDoc = async (data: {
         }),
       ],
     }),
-    ...createDocFooter(meta),
+    ...createDocFooter(meta, examTypeOf(data)),
   );
 
   const doc = new Document({ sections: [{ children: sections }] });
@@ -1137,7 +1183,7 @@ export const generateDefermentDoc = async (data: PromotionData): Promise<Buffer>
             ],
           }),
 
-          ...createDocFooter(meta),
+          ...createDocFooter(meta, examTypeOf(data)),
         ],
       },
     ],
@@ -1173,17 +1219,17 @@ export const generateSupplementaryExamsDoc = async (data: PromotionData): Promis
           children: [
             new TextRun({ text: "The following ", size: 22 }),
             new TextRun({ text: `${numberToWords(count)} (${count}) `, bold: true, size: 22 }),
-            new TextRun({ text: `candidate(s) failed to satisfy the ${meta.schoolName} Board of Examiners in the unit(s) indicated against their names during the `, size: 22 }),
+            new TextRun({ text: `candidate(s) failed to satisfy the ${boardOf(meta, data)} in the unit(s) indicated against their names during the `, size: 22 }),
             new TextRun({ text: `${academicYear} `, bold: true, size: 22 }),
             new TextRun({ text: "Academic Year, ", size: 22 }),
             new TextRun({ text: `${currentYearOrdinal} Year `, bold: true, size: 22 }),
-            new TextRun({ text: "Examinations for the ", size: 22 }),
+            new TextRun({ text: `${examsOf(data)} for the `, size: 22 }),
             new TextRun({ text: `${programName}. `, bold: true, size: 22 }),
-            new TextRun({ text: `The ${meta.schoolName} Board of Examiners recommends that they sit for the supplementary exams when next offered. `, size: 22 }),
+            new TextRun({ text: `The ${boardOf(meta, data)} recommends that they sit for the supplementary exams when next offered. `, size: 22 }),
           ],
         }),
         createStandardUnitDetailTable(suppCandidates, cellMargin, "FAIL"),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ],
     }],
   });
@@ -1221,16 +1267,16 @@ export const generateCarryForwardSuppDoc = async (data: PromotionData): Promise<
               size: 22,
             }),
             new TextRun({ text: `${academicYear} `, bold: true, size: 22 }),
-            new TextRun({ text: `Academic Year, ${ordinal} Year Examinations for the `, size: 22 }),
+            new TextRun({ text: `Academic Year, ${ordinal} Year ${examsOf(data)} for the `, size: 22 }),
             new TextRun({ text: `${programName}. `, bold: true, size: 22 }),
             new TextRun({
-              text: `The ${meta.schoolName} Board of Examiners recommends that they sit for supplementary examinations when next offered.`,
+              text: `The ${boardOf(meta, data)} recommends that they sit for supplementary examinations when next offered.`,
               size: 22,
             }),
           ],
         }),
         createStandardUnitDetailTable(list, cellMargin, "FAIL"),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ],
     }],
   });
@@ -1264,21 +1310,21 @@ export const generateStayoutSuppDoc = async (data: PromotionData): Promise<Buffe
             new TextRun({ text: `${numberToWords(count)} (${count}) `, bold: true, size: 22 }),
             new TextRun({
               text: `candidate(s) were required to stay out and retake examinations. ` +
-                `Having now sat for the failed units, they have not fully satisfied the ${meta.schoolName} ` +
-                `Board of Examiners in the unit(s) indicated against their names during the `,
+                `Having now sat for the failed units, they have not fully satisfied the ${boardOf(meta, data)} ` +
+                `in the unit(s) indicated against their names during the `,
               size: 22,
             }),
             new TextRun({ text: `${academicYear} `, bold: true, size: 22 }),
-            new TextRun({ text: `Academic Year, ${ordinal} Year Examinations for the `, size: 22 }),
+            new TextRun({ text: `Academic Year, ${ordinal} Year ${examsOf(data)} for the `, size: 22 }),
             new TextRun({ text: `${programName}. `, bold: true, size: 22 }),
             new TextRun({
-              text: `The ${meta.schoolName} Board of Examiners recommends that they sit for supplementary examinations (A/SOS) when next offered.`,
+              text: `The ${boardOf(meta, data)} recommends that they sit for supplementary examinations (A/SOS) when next offered.`,
               size: 22,
             }),
           ],
         }),
         createStandardUnitDetailTable(list, cellMargin, "FAIL"),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ],
     }],
   });
@@ -1312,21 +1358,21 @@ export const generateRepeatSuppDoc = async (data: PromotionData): Promise<Buffer
             new TextRun({ text: `${numberToWords(count)} (${count}) `, bold: true, size: 22 }),
             new TextRun({
               text: `candidate(s) were required to repeat the academic year. ` +
-                `After repeating, they have not fully satisfied the ${meta.schoolName} Board of Examiners ` +
+                `After repeating, they have not fully satisfied the ${boardOf(meta, data)} ` +
                 `in the unit(s) indicated against their names during the `,
               size: 22,
             }),
             new TextRun({ text: `${academicYear} `, bold: true, size: 22 }),
-            new TextRun({ text: `Academic Year, ${ordinal} Year Examinations for the `, size: 22 }),
+            new TextRun({ text: `Academic Year, ${ordinal} Year ${examsOf(data)} for the `, size: 22 }),
             new TextRun({ text: `${programName}. `, bold: true, size: 22 }),
             new TextRun({
-              text: `The ${meta.schoolName} Board of Examiners recommends that they sit for supplementary examinations when next offered.`,
+              text: `The ${boardOf(meta, data)} recommends that they sit for supplementary examinations when next offered.`,
               size: 22,
             }),
           ],
         }),
         createStandardUnitDetailTable(list, cellMargin, "FAIL"),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ],
     }],
   });
@@ -1364,16 +1410,16 @@ export const generateReadmissionSuppDoc = async (data: PromotionData): Promise<B
               size: 22,
             }),
             new TextRun({ text: `${academicYear} `, bold: true, size: 22 }),
-            new TextRun({ text: `Academic Year, ${ordinal} Year Examinations for the `, size: 22 }),
+            new TextRun({ text: `Academic Year, ${ordinal} Year ${examsOf(data)} for the `, size: 22 }),
             new TextRun({ text: `${programName}. `, bold: true, size: 22 }),
             new TextRun({
-              text: `The ${meta.schoolName} Board of Examiners recommends that they sit for supplementary examinations when next offered.`,
+              text: `The ${boardOf(meta, data)} recommends that they sit for supplementary examinations when next offered.`,
               size: 22,
             }),
           ],
         }),
         createStandardUnitDetailTable(list, cellMargin, "FAIL"),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ],
     }],
   });
@@ -1413,16 +1459,16 @@ export const generateAcademicLeaveSuppDoc = async (data: PromotionData): Promise
               size: 22,
             }),
             new TextRun({ text: `${academicYear} `, bold: true, size: 22 }),
-            new TextRun({ text: `Academic Year, ${ordinal} Year Examinations for the `, size: 22 }),
+            new TextRun({ text: `Academic Year, ${ordinal} Year ${examsOf(data)} for the `, size: 22 }),
             new TextRun({ text: `${programName}. `, bold: true, size: 22 }),
             new TextRun({
-              text: `The ${meta.schoolName} Board of Examiners recommends that they sit for supplementary examinations when next offered.`,
+              text: `The ${boardOf(meta, data)} recommends that they sit for supplementary examinations when next offered.`,
               size: 22,
             }),
           ],
         }),
         createStandardUnitDetailTable(list, cellMargin, "FAIL"),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ],
     }],
   });
@@ -1485,7 +1531,7 @@ export const generateSimpleAwardListDoc = async (data: {
             ),
           ],
         }),
-        ...createDocFooter(meta),
+        ...createDocFooter(meta, examTypeOf(data)),
       ],
     }],
   });
@@ -2393,4 +2439,5 @@ export const generateStudentTranscript = async (
 
   return await Packer.toBuffer(doc);
 };
+
 

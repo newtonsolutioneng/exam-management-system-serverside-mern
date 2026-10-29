@@ -14,6 +14,7 @@ import { buildDisplayRegNo } from "./academicRules";
 import { splitRegNo, regNoAnyQualifierRegex } from "./regNoQualifier";
 import { getCarryForwardStudentsForUnit, getDeferredSuppStudentsForUnit, getStayoutStudentsForUnit } from "../services/carryForwardService";
 
+
 export interface ScoresheetStudent {
   regNo:            string;
   displayRegNo:     string;
@@ -28,7 +29,9 @@ export interface ScoresheetStudent {
   isRepeatYear:     boolean;
   isDeferredSupp:   boolean;   // NEW: student from higher year, sitting deferred unit
   isExtra:          boolean;   // added by the coordinator: not part of the main class
-   prevMark?:        any;
+  /** CF / stay-out retake: the first-sitting coursework mark is carried (pre-filled and locked), the student re-sits the exam only */
+  lockCA:           boolean;
+  prevMark?:        any;
   qualifierSuffix?: string;
 }
  
@@ -87,7 +90,7 @@ async function _findPriorSpecialMark(studentId: string, puId: string): Promise<a
  
   return null;
 }
-
+ 
 // ─── Batch versions of the two look-ups above ─────────────────────────────────
 // One query per collection for the whole class instead of up to six per student (the per-student
 // version made a 500-student sheet take minutes). The decision rules are identical.
@@ -130,7 +133,23 @@ export function _priorSpecialFrom(pre: UnitPrefetch, sid: string): any | null {
   if (md && (md.caTotal30 ?? 0) > 0) return { ...md, _source: "direct" };
   return null;
 }
- 
+
+/**
+ * The first-sitting coursework mark a CF / stay-out student carries into the retake (ENG.14, ENG.15h:
+ * exam-only retake). Newest mark with real CA that is not itself a supplementary sitting; the detailed
+ * Mark is preferred because it holds the raw CAT / assignment / practical scores.
+ */
+export function _priorCAFrom(pre: UnitPrefetch, sid: string): any | null {
+  const real = (d: any) => (d?.caTotal30 ?? 0) > 0 && String(d.attempt ?? "").toLowerCase() !== "supplementary";
+  const dm = pre.dm.get(sid)?.find(real);
+  if (dm) return { ...dm, _source: "detailed" };
+  const md = pre.md.get(sid)?.find(real);
+  if (md) return { ...md, _source: "direct" };
+  const fg = pre.fg.get(sid)?.find(real);
+  if (fg) return { ...fg, _source: "finalGrade" };
+  return null;
+}
+
 // ─── Derive attempt flags from a mark ────────────────────────────────────────
 function _flagsFromMark(
   mark:          any | null,
@@ -174,8 +193,8 @@ export const buildScoresheetStudentList = async (params: {
   session:        "ORDINARY" | "SUPPLEMENTARY" | "CLOSED";
   passMark:       number;
   /** Reg nos of students outside the main class (other cohorts, late registrations …) to add to the sheet. */
-    extraRegNos?:   string[];
-    institutionId?: unknown;
+  extraRegNos?:   string[];
+  institutionId?: unknown;
 }): Promise<ScoresheetStudent[]> => {
   const { programId, programUnitId, yearOfStudy, academicYearId, session, passMark } = params;
  
@@ -183,7 +202,7 @@ export const buildScoresheetStudentList = async (params: {
   const academicYear = await AcademicYear.findById(academicYearId).lean() as any;
   if (!academicYear) throw new Error("Academic year not found");
   lap("academic year");
-
+ 
   const result:   ScoresheetStudent[] = [];
   const addedIds: Set<string>         = new Set();
  
@@ -210,6 +229,7 @@ export const buildScoresheetStudentList = async (params: {
       isRepeatYear:     false,
       isDeferredSupp:   false,
       isExtra:          false,
+      lockCA:           false,
       qualifierSuffix:  student.qualifierSuffix || "",
       prevMark,
       ...flags,
@@ -241,11 +261,11 @@ export const buildScoresheetStudentList = async (params: {
         const sid = student._id.toString();
         const { mark } = _statusFrom(preMarked, sid, passMark);
         return { mark, priorSpecial: mark?.isSpecial ? _priorSpecialFrom(preMarked, sid) : null };
-                });
-                for (let i = 0; i < studentsWithMarks.length; i++) {
-                  const student = studentsWithMarks[i];
-                  const { mark, priorSpecial } = looked[i];
-                   const flags = _flagsFromMark(mark, student.status, priorSpecial);
+      });
+      for (let i = 0; i < studentsWithMarks.length; i++) {
+        const student = studentsWithMarks[i];
+        const { mark, priorSpecial } = looked[i];
+        const flags = _flagsFromMark(mark, student.status, priorSpecial);
         add(student, flags.attemptLabel, flags, flags.prevMark ?? mark ?? undefined);
       }
     }
@@ -271,16 +291,20 @@ export const buildScoresheetStudentList = async (params: {
         const student = currentStudents[i];
         const { priorStatus, priorSpecial } = lookedCurrent[i];
 
-        // a student who already PASSED this unit in any prior year is skipped
-        if (priorStatus === "PASS") continue;
- 
+        const isRepeat = student.status === "repeat";
+        // A student who already PASSED this unit is skipped, EXCEPT a repeat-year student: repeating the
+        // year means full re-enrolment, every unit, CATs and exam, marked out of 100% (ENG.16).
+        if (priorStatus === "PASS" && !isRepeat) continue;
+
         if (priorSpecial) {
           add(student, ATTEMPT.SPECIAL, { isSpecial: true, isCarriedSpecial: true }, priorSpecial);
+        } else if (isRepeat) {
+          add(student, ATTEMPT.REPEAT_YEAR, { isRepeatYear: true });
         } else if (priorStatus === "SUPPLEMENTARY") {
-          add(student, ATTEMPT.RETAKE, { isStayout: true });
+          const ca = _priorCAFrom(preCurrent, student._id.toString());
+          add(student, ATTEMPT.RETAKE, { isStayout: true, lockCA: !!ca }, ca ?? undefined);
         } else {
-          const isRepeat = student.status === "repeat";
-          add(student, isRepeat ? ATTEMPT.REPEAT_YEAR : ATTEMPT.FIRST, { isRepeatYear: isRepeat });
+          add(student, ATTEMPT.FIRST);
         }
       }
     }
@@ -291,9 +315,10 @@ export const buildScoresheetStudentList = async (params: {
       const cfStudents = await getCarryForwardStudentsForUnit(
         programUnitId.toString(), programId.toString(),
       );
+      // A carried-forward unit is still a SUPPLEMENTARY sitting: coursework locked at 0, mark capped at the pass mark (ENG.13f)
       for (const { student } of cfStudents) {
         if (EXCLUDED.includes(student.status)) continue;
-        add(student, ATTEMPT.CF, { isCarryForward: true });
+        add(student, ATTEMPT.SUPPLEMENTARY, { isCarryForward: true, isSupp: true });
       }
     } catch { }
  
@@ -303,9 +328,11 @@ export const buildScoresheetStudentList = async (params: {
       const stayoutStudents = await getStayoutStudentsForUnit(
         programUnitId.toString(), programId.toString(),
       );
-      for (const { student } of stayoutStudents) {
-        if (EXCLUDED.includes(student.status)) continue;
-        add(student, ATTEMPT.STAYOUT, { isStayout: true });
+      const soList = stayoutStudents.filter(({ student }: any) => !EXCLUDED.includes(student.status));
+      const preSo = await _prefetchUnit(soList.map(({ student }: any) => student._id.toString()), programUnitId.toString());
+      for (const { student } of soList) {
+        const ca = _priorCAFrom(preSo, student._id.toString());
+        add(student, ATTEMPT.STAYOUT, { isStayout: true, lockCA: !!ca }, ca ?? undefined);
       }
     } catch { }
  
@@ -381,6 +408,11 @@ export const buildScoresheetStudentList = async (params: {
  
       for (const student of candidates) {
         const sid = student._id.toString();
+
+        // ENG.13b / ENG.18c: unit deferred to the next ordinary — not on this year's supplementary sheet
+        const deferredHere = ((student as any).deferredSuppUnits ?? []).some((d: any) =>
+          d.status === "pending" && d.programUnitId === programUnitId.toString() && d.fromAcademicYear === academicYear.year);
+        if (deferredHere) continue;
  
         const gradeForUnit = failingGrades.find((g: any) => g.student.toString() === sid);
         const isSpecialUnit = gradeForUnit?.status === "SPECIAL" || gradeForUnit?.isSpecial ||
@@ -411,7 +443,6 @@ export const buildScoresheetStudentList = async (params: {
  
   lap("deferred / supplementary");
   lap.done();
-  // Sort: primary (1), CF (2), stayout/deferred (3)
   // ── Students outside the main class (coordinator-supplied reg nos) ─────────
   for (const raw of params.extraRegNos ?? []) {
     const { base } = splitRegNo(raw);
