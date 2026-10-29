@@ -1,4 +1,3 @@
-
 // serverside/src/utils/scoresheetStudentList.ts
 
 import { lapTimer } from "./perfLog";

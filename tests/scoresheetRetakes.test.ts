@@ -42,6 +42,16 @@ test("repeater is on a unit they already passed; normal passer is not; CF/stay-o
   assert.ok(by.R1?.isRepeatYear, "repeat-year student is on every unit");
   assert.equal(by.R1.attemptLabel, "Repeat");
   assert.equal(by.R1.lockCA, false, "repeat year sits CATs and exam in full");
-  assert.ok(by.C1?.isCarryForward && by.C1.lockCA, "CF retake carries its CA");
-  assert.equal(by.C1.prevMark.caTotal30, 18);
+  assert.ok(by.C1?.isCarryForward && by.C1.isSupp, "a CF unit is still a supplementary sitting");
+  assert.equal(by.C1.attemptLabel, "Supp");
+});
+
+import { rowHasNoEntries } from "../src/services/resultRows";
+test("an empty sheet row is not applied; typed marks are", () => {
+  const blank = ["", "E1", "NAME", "1st", "", "", "", "", "", "", "", "", "", 0, "", "", "", "", "", 0, 0, "", 0, "B"];
+  assert.equal(rowHasNoEntries(blank, "detailed"), true);
+  assert.equal(rowHasNoEntries(["", "E1", "N", "1st", "", 30], "direct"), false);
+  assert.equal(rowHasNoEntries(["", "E1", "N", "Supp", 0, ""], "direct"), true);   // supp row, only the locked CA
+  assert.equal(rowHasNoEntries(["", "E1", "N", "Supp", 0, 45], "direct"), false);
+  assert.equal(rowHasNoEntries(["", "E1", "N", "1st", 20, ""], "direct"), false);  // CA-only first sitting still applied
 });
